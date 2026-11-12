@@ -1,12322 +1,2286 @@
-
-local G = (getgenv and getgenv()) or _G
-for _, key in ipairs({ "__KzoyzOpus", "__GTFarm" }) do -- __GTFarm = nama versi lama
-    if G[key] and G[key].Cleanup then pcall(G[key].Cleanup) end
-    G[key] = nil
-end
-local Session = {}
-G.__KzoyzOpus = Session
-local function alive()
-    return G.__KzoyzOpus == Session
-end
-
-do
-    local getId = getthreadidentity or get_thread_identity or getidentity or (syn and syn.get_thread_identity)
-    if type(getId) == "function" then pcall(function() Session.Ident = getId() end) end
-    Session.Exec = coroutine.create(function(job)
-        while true do
-            job.ok, job.err = pcall(job.fn)
-            job.done = true
-            Session.ExecBusy = false
-            job = coroutine.yield()
-        end
-    end)
-end
-
----------------------------------------------------------------------
--- SERVICES & MODULE GAME
----------------------------------------------------------------------
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local RunService = game:GetService("RunService")
-local VirtualUser = game:GetService("VirtualUser")
-local UserInputService = game:GetService("UserInputService")
-local LocalPlayer = Players.LocalPlayer
-local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
-
-local Shared = ReplicatedStorage:WaitForChild("Shared")
-local WorldRemotes = ReplicatedStorage:WaitForChild("WorldRemotes")
--- Remote lama (versi game sebelum ByteNet). Hanya dipakai kalau fungsi baru tidak ada.
-local SetTileRemote = WorldRemotes:FindFirstChild("SetTile")
-
-local ItemDB = require(Shared.ItemDB)
-local InventoryModule = require(Shared.Inventory)
-local NetOk, Net = pcall(require, Shared.Net)
-
-local GameGui = PlayerGui:WaitForChild("GameGui")
-local ParticlesOk, ParticlesModule = pcall(require, GameGui:WaitForChild("Particles"))
-local MenuModOk, MenuModule = pcall(require, GameGui:WaitForChild("WorldMenu"))
-local RolesOk, RolesModule = pcall(require, Shared:FindFirstChild("Roles"))
-local SfxOk, SfxModule = pcall(require, Shared:FindFirstChild("Sfx"))
-
-local WindUI = loadstring(game:HttpGet(
-    "https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"
-))()
-
----------------------------------------------------------------------
--- PENGATURAN & DATA
----------------------------------------------------------------------
-local State = {
-    Running = false,
-    Mode = "Place + Break",       -- "Place + Break" | "Break saja" | "Place saja"
-    PlaceMs = 250,                -- jeda setelah tiap place
-    BreakMs = 220,                -- jeda tiap pukulan (normal 220)
-    AfterBreakMs = 300,           -- jeda setelah block hancur
-    HitsOverride = 0,             -- jumlah pukulan manual (0 = otomatis)
-    BreakBackground = true,       -- selalu ikut pecah background (tanpa tombol)
-    MultiTarget = 1,              -- jumlah tile dipukul bergantian (1 = biasa)
-    SelectedId = nil,
-    Offsets = {},                 -- tile yang dipilih di Grid
-    CalibX = 0,
-    CalibY = 0,
-    AntiAfk = true,
-    MutePunch = true,
-    Visual = true,                -- animasi tangan saat break / place / tanam / panen (tampilan saja)
-    LiteMode = false,
-    AutoCollect = true,           -- ambil drop di tile yang dipilih
-    CollectAround = false,        -- ambil drop di sekitar karakter (radius) kapan saja
-    CollectRadius = 3,            -- jari-jari collect (tile), dipakai mode Remote
-    CollectMode = "Sentuhan",     -- "Sentuhan" (badan, seperti main manual) / "Remote" (ambil dari jauh, cara lama)
-    Override = nil,               -- Pabrik memakai tile & block sendiri
-    Quiet = false,                -- tanpa notifikasi (dipakai Pabrik)
-    Cycles = 0,
-    Placed = 0,
-    Broken = 0,
-    Collected = 0,                -- jumlah drop yang diambil
-    CollectFail = 0,              -- jumlah drop yang ditolak server
-    LastAction = "-",
-    SeedDrop = false,             -- seed hasil break sudah banyak -> drop ke titik drop
-    SeedDropAt = 190,             -- drop kalau seed sudah sebanyak ini
-    SeedKeep = 0,                 -- seed yang disisakan
-    Dropped = 0,
-    DropPause = false,            -- Auto Farm dijeda sementara (sedang pergi drop)
-}
-
-local Misc = {
-    Speed = 100,      -- walkspeed % (100 = normal)
-    InfJump = false,
-    Ghost = false,    -- fly + tembus block
-    UpHeld = false,   -- tombol ▲ di layar ditahan
-    DownHeld = false, -- tombol ▼ di layar ditahan
-    CustomName = true,          -- watermark nama (selalu aktif, mati hanya saat script ditutup)
-    NameText = "Zekio supreme",  -- teks watermark
-}
-
--- Auto Clear World
-local Clear = {
-    Running = false,
-    IncludeBg = true,         -- ikut pecah background
-    UseBlock = true,          -- taruh block kalau tidak ada pijakan
-    ScaffoldId = nil,         -- block yang dipakai untuk pijakan
-    Collect = true,           -- ambil drop tiap habis pecah
-    Sweep = "Kiri → Kanan",   -- "Kiri → Kanan" atau "Zig-zag"
-    Skip = {},                -- tile yang dilewati sementara
-    TopRow = -1,              -- baris yang sedang dibersihkan
-    DirRow = nil,             -- arah zig-zag untuk baris ini
-    Dir = nil,
-    Broken = 0,
-    Remaining = -1,
-    Status = "-",
-}
-
--- Auto Splice: tanam Seed A lalu splice Seed B
-local Splice = {
-    Running = false,
-    Roam = true,        -- keliling world pakai A* (false = hanya tile Grid)
-    Roaming = false,
-    A = nil,
-    B = nil,
-    Ms = 300,
-    Made = 0,
-    Planted = 0,
-    Fail = {},
-    Skip = {},
-    Status = "-",
-    Row = {},           -- baris yang sedang dikerjakan (rapi per baris)
-}
-
--- Lahan (farm world): baris block dari atas ke bawah
-local Land = {
-    X0 = 0, X1 = 99,  -- kolom awal & akhir
-    Y0 = 2,           -- baris block paling atas
-    Gap = 2,          -- jarak antar baris (2 = ada 1 tile kosong untuk pohon)
-    Rows = 10,        -- jumlah baris
-    Stairs = true,    -- ujung baris dibuka bergantian kiri/kanan (jalan naik-turun seperti tangga)
-}
-
--- Bangun Lahan
-local Build = {
-    Running = false,
-    BlockId = nil,
-    UseBlock = true,     -- boleh taruh block pijakan kalau baris pertama tidak terjangkau
-    Produce = true,      -- block kurang -> produksi dulu (tanam & panen) sampai cukup
-    ThenPabrik = false,  -- selesai -> langsung jalankan Pabrik
-    Placed = 0,
-    Phase = "-",
-    Status = "-",
-    Skip = {},
-    FieldSkip = {},      -- tile panen / tanam yang dilewati sementara (produksi block)
-    Row = {},            -- baris tanam produksi yang sedang dikerjakan
-    Harvested = 0,
-    Planted = 0,
-    Dug = 0,             -- tile yang digali (block + background)
-    Carved = {},         -- [idx] = true: block-nya digali Bangun Lahan (background ikut dipecah)
-    Surface = nil,       -- y permukaan tanah asli (di bawahnya background ikut dipecah)
-    Under = {},          -- [baris] = waktu: sementara pasang dari bawah (tidak bisa naik ke baris itu)
-    BreakTimes = {},     -- tile yang terus balik lagi setelah digali
-    Reserve = 0,         -- block yang tidak boleh dipasang (disisakan untuk bikin seed)
-    RESERVE = 10,        -- sisakan block segini saat produksi
-    BreakX = -1, BreakY = -1, -- posisi break produksi (belum diatur = otomatis di ujung kanan baris)
-    Tiles = {},          -- tile break produksi, relatif ke posisi break ("dx,dy") (Grid mode Lahan)
-}
-
--- Vending: isi stock dari drop / kosongkan sampai habis
-local Vend = {
-    Running = false,
-    Mode = "Isi stock dari drop",  -- atau "Kosongkan sampai habis"
-    Point = "",                    -- titik drop vending: "WORLD" / "WORLD:ID" (kosong = world ini)
-    Status = "-",
-    Stocked = 0, Taken = 0, Dropped = 0,
-    Picked = {},                   -- [id] = jumlah hasil pungut yang belum masuk vending
-    Items = {},                    -- item yang boleh diambil / di-stock / dikosongkan (kosong = semua)
-    Kind = "Semua",                -- "Semua" / "Block saja" / "Seed saja"
-    Seen = {},                     -- item yang pernah terlihat (vending, tas, drop) untuk daftar pilihan
-    DropX = -1, DropY = -1,        -- posisi berdiri di titik drop vending (-1 = titik kedatangan)
-    Carry = {},                    -- [id] = jumlah yang diambil dari vending (mode kosongkan)
-}
-
--- Pabrik: break block -> tanam seed -> panen -> break lagi, seed lebihan di-drop
-local Pabrik = {
-    Running = false,
-    SeedId = nil,
-    BlockId = nil,
-    WholeWorld = false,  -- tanam & panen di seluruh world (bukan hanya lahan)
-    Tiles = {},          -- tile break, relatif ke posisi break ("dx,dy")
-    BreakX = -1, BreakY = -1,
-    BreakSec = 60,       -- lama 1 sesi break sebelum cek pohon lagi
-    Drop = true,
-    Keep = 50,           -- seed yang disisakan untuk ditanam lagi
-    DropAt = 200,        -- drop kalau seed sudah sebanyak ini
-    DropWorld = "",      -- "" = world ini | "WORLD" | "WORLD:ID"
-    DropX = -1, DropY = -1,
-    Harvested = 0,
-    Planted = 0,
-    Dropped = 0,
-    Skip = {},
-    Status = "-",
-    Traveling = false,
-    Home = "",
-    Zone = nil,          -- tempat drop (tidak ikut di-collect), dipakai semua fitur drop
-    Row = {},            -- baris tanam yang sedang dikerjakan
-}
-
-local Guard = {
-    On = false,
-    Who = "Staff (Mod/Dev)",   -- "Staff (Mod/Dev)" | "Semua pemain"
-    StopAll = true,            -- diam semua aktivitas
-    Leave = false,             -- keluar world
-    AutoBack = true,           -- lanjut lagi setelah aman
-    BackSec = 60,              -- (keluar world) tunggu sebelum masuk lagi
-    CalmSec = 5,               -- (diam) tunggu sepi dulu sebelum lanjut
-    Mode = "idle",             -- idle | pause | away | out | back
-    Allow = {},                -- pemain biasa yang sudah ada saat Penjaga dinyalakan (diabaikan)
-    Alerted = {},              -- sudah diberi peringatan
-    Saved = nil,               -- aktivitas sebelum dihentikan
-    Token = 0,
-    BackAt = 0,
-    CalmAt = nil,
-    LeftFg = nil,
-    BackText = nil,
-    Status = "Mati",
-    Detected = 0,
-}
-
--- Farmer: panen & tanam otomatis
-local Farmer = {
-    Running = false,
-    Harvest = true,
-    Plant = true,
-    Collect = true,
-    UseBlock = false,   -- taruh block kalau tidak ada jalan
-    ScaffoldId = nil,
-    HarvestMs = 250,    -- jeda setelah tiap panen
-    PlantMs = 250,      -- jeda setelah tiap tanam
-    SeedId = nil,
-    Skip = {},
-    Harvested = 0,
-    Planted = 0,
-    Status = "-",
-    Drop = false,       -- inventori hampir penuh -> drop hasil panen ke titik drop
-    DropAt = 190,       -- drop kalau item hasil panen sudah sebanyak ini
-    Keep = 50,          -- seed tanam yang disisakan
-    Dropped = 0,
-    Got = {},           -- seed pohon yang pernah dipanen (untuk cari item hasil panen)
-    Row = {},           -- baris tanam yang sedang dikerjakan (tanam rapi per baris)
-}
-
--- Tombol gerak buatan (dipakai Clear & Farmer)
-local AutoInput = { active = false, left = false, right = false, jump = false, down = false }
-
--- Auto Chat
-local Spam = {
-    On = false,
-    Texts = {},         -- daftar pesan, dikirim bergantian
-    IntervalSec = 6,
-    Index = 1,
-    Sent = 0,
-    Last = "-",
-}
-
-local Refs = {
-    World = nil,      -- data world (fg, bg, ukuran)
-    Inv = nil,        -- inventori
-    SetTile = nil,    -- fungsi place game
-    State = nil,      -- posisi karakter
-    Punch = nil,      -- fungsi pukul game
-    Particles = {},   -- particle (untuk mode Lite)
-    Menu = nil,       -- menu game (keluar / masuk world)
-    Gems = nil,       -- update angka gems
-    Hud = nil,        -- jangkauan pukul & place
-    Trees = nil,      -- data pohon (waktu tanam)
-    Others = nil,     -- daftar pemain lain di world (untuk Penjaga)
-}
-
--- Daftar drop di world (diambil dari game)
-local Drops = { list = nil, update = nil, brokeAt = {} }
--- Animasi aksi: fungsi gambar tangan game + nomor upvalue "aksi terakhir" (diisi saat hubungkan)
-local Anim = { fn = nil, idx = nil, set = nil }
-local DropFailUntil = {}   -- drop yang ditolak, dicoba lagi nanti
-
-local UI = {}
-
--- Jalankan fn dengan izin penuh. Hasil: ok, err (seperti pcall)
-function UI.ident()
-    local getId = getthreadidentity or get_thread_identity or getidentity or (syn and syn.get_thread_identity)
-    if type(getId) ~= "function" then return nil end
-    local ok, v = pcall(getId)
-    return ok and v or nil
-end
-function UI.exec(fn)
-    local setId = setthreadidentity or set_thread_identity or setidentity or (syn and syn.set_thread_identity)
-    local function elevate()
-        if Session.Ident and type(setId) == "function" then pcall(setId, Session.Ident) end
-    end
-    local co = Session.Exec
-    if co and not Session.ExecBusy and coroutine.status(co) == "suspended" then
-        local job = { fn = function() elevate(); fn() end }
-        Session.ExecBusy = true
-        local okR, errR = coroutine.resume(co, job)
-        if okR then
-            -- Refresh bisa yield. Tunggu hasil sebenarnya, bukan hasil resume pertama.
-            local deadline = os.clock() + 10
-            while not job.done do
-                if not alive() then return false, "Sesi script sudah ditutup" end
-                if os.clock() >= deadline then return false, "Pekerjaan UI belum selesai setelah 10 detik" end
-                task.wait()
-            end
-            return job.ok, job.err
-        end
-        Session.ExecBusy = false
-        return false, tostring(errR)
-    end
-    -- cadangan: jalankan di thread ini (setelah identitasnya dikembalikan)
-    elevate()
-    local ok2, err2 = pcall(fn)
-    if ok2 then return true end
-    return false, tostring(err2)
-end
-UI.Jobs = {}
-function UI.later(key, fn, delay)
-    UI.Jobs[key] = { fn = fn, at = os.clock() + (delay or 0) }
-end
--- Jalankan pekerjaan UI yang sudah waktunya (dipanggil oleh thread INIT, lihat bagian INIT)
-function UI.runJobs()
-    local now = os.clock()
-    local due = {}
-    for key, job in pairs(UI.Jobs) do
-        if now >= job.at then due[#due + 1] = key end
-    end
-    for _, key in ipairs(due) do
-        local job = UI.Jobs[key]
-        if job and now >= job.at then
-            UI.Jobs[key] = nil
-            local ok, err = pcall(job.fn)
-            if not ok then warn("[Zekio supreme] UI job " .. tostring(key) .. ": " .. tostring(err)) end
-        end
-    end
-end
-local Connections = {}
-local HitCount = {}   -- hitung pukulan (cadangan)
-local PlacedAt = {}   -- kapan tile di-place
-
----------------------------------------------------------------------
--- BAHASA (Indonesia / English)
----------------------------------------------------------------------
--- Cara kerja:
---   - Semua teks script ditulis dalam Bahasa Indonesia.
---   - Kalau English dipilih, I18N.T(teks) menerjemahkan:
---       1. teks utuh (judul & deskripsi menu) dari daftar EN
---       2. teks yang berubah-ubah (status, notifikasi) per frasa dari daftar PH
---   - Menu WindUI dibungkus (I18N.wrap) supaya judul, deskripsi & isi status ikut diterjemahkan.
-local I18N = { Lang = "id", Saved = "id", Ask = true }
-
-do (function() -- fungsi sendiri: variabel di dalam tidak ikut batas 200 local
-
-I18N.EN = {
-    -- grup sidebar & tab
-    ["Fitur"] = "Features", ["Keamanan"] = "Security", ["Setelan"] = "Setup",
-    ["Pengaturan"] = "Settings", ["Penjaga"] = "Guard", ["Statistik"] = "Stats", ["Tas"] = "Bag",
-    ["Lahan"] = "Land", ["Pabrik"] = "Factory", ["Koneksi"] = "Connection",
-    -- kotak
-    ["Kontrol"] = "Controls", ["Mode & Kecepatan"] = "Mode & Speed", ["Kecepatan"] = "Speed",
-    ["Karakter"] = "Character", ["Opsi"] = "Options", ["Pesan"] = "Messages",
-    ["Aksi saat terdeteksi"] = "Action when detected", ["Waktu"] = "Timing", ["Lainnya"] = "Other",
-    ["Quest Harian"] = "Daily Quests", ["Pohon (siap panen)"] = "Trees (ready to harvest)",
-    ["Auto Recycle (buang item)"] = "Auto Recycle (trash items)", ["Bentuk lahan"] = "Land shape",
-    ["Pilihan"] = "Options", ["Posisi & tile break"] = "Break position & tiles",
-    ["Koreksi posisi"] = "Position correction", ["Yang dikirim"] = "What to send",
-    -- Farm
-    ["Bisa juga lewat tombol START di Grid"] = "Can also use the START button in the Grid",
-    ["Ambil drop di tile yang dipilih"] = "Pick up drops on the selected tiles",
-    ["Collect di sekitar karakter"] = "Collect around character",
-    ["Ambil semua drop dalam radius, kapan saja"] = "Pick up all drops within the radius, anytime",
-    ["Radius collect (tile)"] = "Collect radius (tiles)",
-    ["Dipakai juga Clear, Farmer, Splice & Pabrik. Terlalu jauh bisa ditolak server"] =
-        "Also used by Clear, Farmer, Splice & Factory. Too far may be rejected by the server",
-    ["Buka Grid Tile"] = "Open Tile Grid",
-    ["Kotak 5x5, tengah = karakter"] = "5x5 grid, center = character",
-    -- Clear
-    ["Status Clear"] = "Clear Status",
-    ["Bersihkan dari baris atas ke bawah"] = "Clear from the top row down",
-    ["Arah sapu"] = "Sweep direction",
-    ["Zig-zag lebih cepat (tidak balik ke kiri)"] = "Zig-zag is faster (no going back left)",
-    ["Pakai block pijakan"] = "Use scaffold blocks",
-    ["Taruh block untuk lewat jurang / naik ke block melayang"] = "Place blocks to cross gaps / reach floating blocks",
-    ["Block pijakan"] = "Scaffold block",
-    ["Block yang dipakai untuk pijakan"] = "Block used as scaffold",
-    ["Auto collect tiap habis pecah"] = "Auto collect after each break",
-    ["Ambil drop di sekitar karakter"] = "Pick up drops around the character",
-    ["Reset tile yang dilewati"] = "Reset skipped tiles",
-    ["Coba lagi tile yang tadi gagal"] = "Retry tiles that failed",
-    -- Farmer
-    ["Status Farmer"] = "Farmer Status",
-    ["Jalankan Farmer"] = "Run Farmer",
-    ["Panen pohon siap & tanam seed otomatis"] = "Harvest ready trees & plant seeds automatically",
-    ["Seed untuk ditanam"] = "Seed to plant",
-    ["Hanya seed yang ada di inventori"] = "Only seeds in your inventory",
-    ["Refresh daftar seed"] = "Refresh seed list",
-    ["Hanya pohon yang sudah siap"] = "Only trees that are ready",
-    ["Tanam di atas block yang kosong"] = "Plant on top of empty blocks",
-    ["Ambil hasil panen di sekitar karakter"] = "Pick up harvest drops around the character",
-    ["Jeda setelah tiap panen"] = "Delay after each harvest",
-    ["Jeda setelah tiap tanam seed"] = "Delay after each seed planted",
-    ["Taruh block kalau tidak ada jalan (block tetap tertinggal)"] = "Place blocks when there is no path (blocks stay behind)",
-    -- Speed & opsi
-    ["Place semua tile dulu, lalu break"] = "Place all tiles first, then break",
-    ["Jeda setelah tiap place"] = "Delay after each place",
-    ["Jeda tiap pukulan (normal 220). Dipakai juga Clear"] = "Delay per hit (normal 220). Also used by Clear",
-    ["Auto Farm: tile dipukul bergantian (seperti 2 jari). Pakai Rayman's Fist = 2-3 tile segaris sekali pukul"] =
-        "Auto Farm: tiles are hit in turns (like 2 fingers). With Rayman's Fist = 2-3 tiles in a line per punch",
-    ["Jeda setelah hancur (ms)"] = "Delay after break (ms)",
-    ["Tunggu sebelum lanjut ke tile berikutnya"] = "Wait before moving to the next tile",
-    ["Mode Lite"] = "Lite Mode",
-    ["Matikan particle & suara (HP low-end)"] = "Turn off particles & sounds (low-end phones)",
-    ["Mute suara pukulan"] = "Mute punch sounds",
-    ["Pukulan per block (cadangan)"] = "Hits per block (fallback)",
-    ["Dipakai kalau 'Pukul: TIDAK'. 0 = otomatis"] = "Used when 'Punch: NO'. 0 = automatic",
-    ["Pilih Block"] = "Select Block",
-    ["Hanya item yang bisa di-place"] = "Only placeable items",
-    ["Refresh daftar"] = "Refresh list",
-    ["Lompat di udara (bisa kena rollback)"] = "Jump mid-air (may get rolled back)",
-    ["Fly + Tembus Block"] = "Fly + Noclip",
-    ["Tembus block, pakai tombol ▲/▼ (bisa kena rollback)"] = "Pass through blocks, use the ▲/▼ buttons (may get rolled back)",
-    ["Bahasa / Language"] = "Language / Bahasa",
-    ["Titik Drop"] = "Drop Point", ["Atur titik drop"] = "Set drop point", ["Drop otomatis"] = "Auto drop",
-    ["Seed sudah banyak: jeda, drop ke titik drop (tab Titik Drop), balik ke posisi farm"] =
-        "Too many seeds: pause, drop at the drop point (Drop Point tab), return to farm position",
-    ["Seed dari block yang dipilih"] = "Seeds of the selected block",
-    ["Drop kalau hampir penuh"] = "Drop when almost full",
-    ["Hasil panen (block & seed) dibawa ke titik drop (tab Titik Drop)"] =
-        "Harvest items (blocks & seeds) are taken to the drop point (Drop Point tab)",
-    ["Drop kalau item sudah"] = "Drop when an item reaches",
-    ["Maksimal 200 per item"] = "Max 200 per item",
-    ["Sisakan seed tanam"] = "Seeds to keep for planting",
-    ["Seed yang dipilih untuk ditanam tidak di-drop semua"] = "The planting seed is not dropped completely",
-    ["Ke titik drop (tab Titik Drop)"] = "To the drop point (Drop Point tab)",
-    ["Block kurang diproduksi dulu, lalu dipasang dari atas seperti ular (tanpa pijakan)"] =
-        "Missing blocks are produced first, then placed from the top like a snake (no scaffolding)",
-    ["Gali dulu dari permukaan sampai bawah, lalu pasang baris naik sampai atas (baris jadi jembatan). Block habis: produksi 1 baris"] =
-        "Digs from the surface down to the bottom first, then places rows upward to the top (each row is its own bridge). Out of blocks: produces on 1 row",
-    ["Baris block paling atas. Baris di bawahnya otomatis sampai di atas bedrock (tanah digali)"] =
-        "Top block row. Rows below go automatically down to just above bedrock (dirt is dug out)",
-    ["Berdiri di atas block pertama baris paling atas, lalu tekan (tangga kiri di sebelah kirinya)"] =
-        "Stand on the first block of the top row, then press (left stairs go to its left)",
-    ["Baris block paling atas. Baris di bawahnya dibuat otomatis sampai tanah"] =
-        "Top block row. Rows below are made automatically down to the ground",
-    ["Ganti bahasa, lalu execute ulang"] = "Change language, then re-execute",
-    ["Mode collect"] = "Collect mode", ["Sentuhan"] = "Touch",
-    ["Berlaku untuk semua fitur. Sentuhan = seperti main manual. Remote = ambil dari jauh (cara lama, cepat)"] =
-        "Applies to all features. Touch = like manual play. Remote = picks up from a distance (old method, fast)",
-    ["Ambil drop di semua tile grid (caranya ikut Mode collect)"] = "Pick up drops on all grid tiles (method follows Collect mode)",
-    ["Radius collect (mode Remote)"] = "Collect radius (Remote mode)",
-    ["Jarak ambil drop di sekitar karakter (tile)"] = "Pickup distance around the character (tiles)",
-    ["Animasi aksi"] = "Action animation",
-    ["Tangan bergerak saat break / place / tanam / panen + efek place. Matikan untuk hemat FPS"] =
-        "Arm moves on break / place / plant / harvest + place effect. Turn off to save FPS",
-    ["Jenis item"] = "Item type",
-    ["Berlaku untuk isi stock (drop yang dipungut) dan kosongkan (vending yang diambil)"] =
-        "Applies to stock (drops picked up) and empty (vendings taken from)",
-    ["Block saja"] = "Blocks only", ["Seed saja"] = "Seeds only",
-    ["Item yang diambil"] = "Items to take",
-    ["Bisa pilih banyak. Kosong = semua item. Daftar: isi vending, tas & drop yang terlihat"] =
-        "Multi-select. Empty = all items. List: vending contents, backpack & seen drops",
-    ["Muat ulang daftar item"] = "Reload item list",
-    ["Pilih item"] = "Pick items",
-    ["Tambah item yang dipegang"] = "Add the held item",
-    ["Pilih item di tas game (dipegang), lalu tekan. Masuk ke daftar item yang diambil"] =
-        "Select an item in the game backpack (held), then press. Adds it to the items to take",
-    ["Hapus pilihan item"] = "Clear item selection",
-    ["Kembali ke semua item"] = "Back to all items",
-    ["Simpan posisi drop vending (posisi karakter)"] = "Save vending drop position (character position)",
-    ["Berdiri di tempat drop (boleh di world titik drop), lalu tekan. Dipakai mode isi stock & kosongkan"] =
-        "Stand at the drop spot (can be in the drop-point world), then press. Used by stock & empty modes",
-    ["Hapus posisi drop vending"] = "Clear vending drop position",
-    ["Drop / tunggu di titik kedatangan (pintu) saja"] = "Drop / wait at the arrival point (door) only",
-    ["Ambil item dari vending, tas & drop di world ini"] = "Read items from vendings, backpack & drops in this world",
-    ["Posisi break produksi = posisi karakter"] = "Production break position = character position",
-    ["Berdiri di tempat break lalu tekan. Tekan lagi di tempat yang sama = kembali otomatis"] =
-        "Stand at the break spot and press. Press again at the same spot = back to automatic",
-    ["Pilih tile break produksi (Grid)"] = "Pick production break tiles (Grid)",
-    ["Grid terbuka dalam mode Lahan (terpisah dari Auto Farm & Pabrik)"] =
-        "Grid opens in Land mode (separate from Auto Farm & Factory)",
-    ["Status Vending"] = "Vending Status",
-    ["Jalankan Vending"] = "Run Vending",
-    ["Jalankan di world vending milikmu"] = "Run it in your vending world",
-    ["Titik drop vending"] = "Vending drop point",
-    ["WORLD atau WORLD:ID (kosong = world ini). Isi stock: ambil drop di sini. Kosongkan: drop di sini"] =
-        "WORLD or WORLD:ID (empty = this world). Stock: picks up drops here. Empty: drops here",
-    ["Isi stock dari drop"] = "Stock from drops",
-    ["Kosongkan sampai habis"] = "Empty until done",
-    ["Drop di semua tile grid diambil dengan sentuhan badan (melangkah / lompat), tanpa remote"] =
-        "Drops on every grid tile are picked up by body touch (step / jump), no remote",
-    ["Drop di sekitar disusuri sampai tersentuh badan (tanpa remote)"] =
-        "Nearby drops are walked over until the body touches them (no remote)",
-    -- Chat
-    ["Status Chat"] = "Chat Status",
-    ["Daftar pesan"] = "Message list",
-    ["Pisahkan dengan |   contoh: halo|jual dirt"] = "Separate with |   example: hi|selling dirt",
-    ["pesan 1|pesan 2|pesan 3"] = "message 1|message 2|message 3",
-    ["Interval (detik)"] = "Interval (seconds)",
-    ["Jeda antar pesan (min 3 detik)"] = "Delay between messages (min 3 seconds)",
-    ["Kirim pesan bergantian sesuai urutan"] = "Send messages in order, one after another",
-    ["Kirim 1 pesan sekarang"] = "Send 1 message now",
-    ["Tes kirim pesan berikutnya"] = "Test sending the next message",
-    ["Isi daftar pesan dulu (tekan Enter setelah mengetik)"] = "Fill in the message list first (press Enter after typing)",
-    -- Penjaga
-    ["Status Penjaga"] = "Guard Status",
-    ["Mati"] = "Off",
-    ["Aktifkan Penjaga"] = "Enable Guard",
-    ["Pantau Mod / Dev / pemain yang masuk world"] = "Watch for Mods / Devs / players entering the world",
-    ["Yang dideteksi"] = "Detect",
-    ["Semua pemain: yang sudah ada saat dinyalakan diabaikan"] = "All players: those already here when enabled are ignored",
-    ["Diam semua aktivitas"] = "Pause all activities",
-    ["Keluar world"] = "Leave world",
-    ["Langsung keluar world saat terdeteksi"] = "Leave the world immediately when detected",
-    ["Lanjut otomatis setelah aman"] = "Auto resume when safe",
-    ["Keluar world: masuk lagi, cek, lalu lanjut aktivitas sebelumnya"] = "Leave world: rejoin, check, then resume previous activity",
-    ["Masuk world lagi setelah (detik)"] = "Rejoin world after (seconds)",
-    ["Untuk mode keluar world"] = "For leave-world mode",
-    ["Tunggu aman (detik)"] = "Safe wait (seconds)",
-    ["Untuk mode diam: jeda setelah mereka pergi"] = "For pause mode: delay after they leave",
-    ["Abaikan pemain yang ada sekarang"] = "Ignore players here now",
-    ["Untuk teman / akun sendiri (staff tetap dideteksi)"] = "For friends / alt accounts (staff are still detected)",
-    ["Batalkan tunggu / lanjut"] = "Cancel wait / resume",
-    ["Hentikan proses keluar-masuk & lanjut otomatis"] = "Stop the leave-rejoin process & auto resume",
-    ["Dibatalkan"] = "Cancelled",
-    -- Bonus
-    ["Klaim hadiah quest yang sudah selesai"] = "Claim rewards for finished quests",
-    ["Cek quest sekarang"] = "Check quests now",
-    ["Tukar semua code aktif yang belum dipakai"] = "Redeem all active codes not used yet",
-    ["Cek code sekarang"] = "Check codes now",
-    ["Redeem code manual"] = "Redeem code manually",
-    ["Ketik code lalu tekan Enter"] = "Type a code then press Enter",
-    ["KODE"] = "CODE",
-    -- Growscan
-    ["Info World"] = "World Info",
-    ["Tekan Scan sekarang"] = "Press Scan now",
-    ["Update otomatis tiap 2 detik"] = "Auto update every 2 seconds",
-    ["Scan sekarang"] = "Scan now",
-    ["Cari item"] = "Search item",
-    ["Saring nama item (kosongkan = semua)"] = "Filter item name (empty = all)",
-    ["contoh: seed"] = "example: seed",
-    ["Daftar"] = "List",
-    -- Statistik
-    ["Sesi ini"] = "This session",
-    ["Reset statistik"] = "Reset stats",
-    ["Mulai hitung dari nol"] = "Start counting from zero",
-    ["Kirim ke Discord sekarang"] = "Send to Discord now",
-    ["Perlu webhook di tab Discord"] = "Needs a webhook in the Discord tab",
-    ["Aktifkan webhook Discord dulu"] = "Enable the Discord webhook first",
-    ["Direset"] = "Reset",
-    ["Masuk antrian kirim"] = "Added to send queue",
-    -- Tas
-    ["Item yang dipilih di-recycle otomatis"] = "Selected items are recycled automatically",
-    ["Item yang di-recycle"] = "Items to recycle",
-    ["Bisa pilih banyak. Tool & lock tidak ditampilkan"] = "Multiple allowed. Tools & locks are not shown",
-    ["Recycle kalau jumlah >="] = "Recycle when amount >=",
-    ["200 = hanya saat penuh 1 slot"] = "200 = only when a slot is full",
-    ["Sisakan"] = "Keep",
-    ["Jumlah yang tidak ikut di-recycle"] = "Amount not recycled",
-    ["Refresh daftar item"] = "Refresh item list",
-    ["100 WL -> 1 DL, 100 DL -> 1 BGL (sama seperti game)"] = "100 WL -> 1 DL, 100 DL -> 1 BGL (same as the game)",
-    -- Splice
-    ["Status Splice"] = "Splice Status",
-    ["Tanam Seed A lalu splice Seed B"] = "Plant Seed A then splice Seed B",
-    ["Seed A (ditanam)"] = "Seed A (planted)",
-    ["Seed B (di-splice)"] = "Seed B (spliced)",
-    ["Keliling world (A*)"] = "Roam world (A*)",
-    ["Nyala: jalan ke seluruh world. Mati: hanya tile Grid 5x5"] = "On: walk the whole world. Off: only the 5x5 Grid tiles",
-    ["Jeda tanam / splice (ms)"] = "Plant / splice delay (ms)",
-    -- Lahan
-    ["Status Lahan"] = "Land Status",
-    ["Bangun Lahan"] = "Build Land",
-    ["Hitung block, produksi kalau kurang, lalu pasang dari baris bawah"] = "Count blocks, produce if short, then place from the bottom row",
-    ["Block lahan"] = "Land block",
-    ["Block padat dari inventori"] = "Solid block from inventory",
-    ["X awal"] = "Start X",
-    ["Kolom paling kiri"] = "Leftmost column",
-    ["X akhir"] = "End X",
-    ["Kolom paling kanan (lebih dari lebar world = sampai ujung)"] = "Rightmost column (beyond world width = to the edge)",
-    ["Y baris atas"] = "Top row Y",
-    ["Baris block paling atas (minimal 1)"] = "Topmost block row (minimum 1)",
-    ["Jarak antar baris"] = "Row spacing",
-    ["2 = y1, y3, y5.. | 3 = y1, y4, y7.. (maks 3 supaya bisa lompat naik)"] = "2 = y1, y3, y5.. | 3 = y1, y4, y7.. (max 3 so you can jump up)",
-    ["Jumlah baris"] = "Number of rows",
-    ["Tangga di pojok kiri-kanan"] = "Stairs at left-right corners",
-    ["Ujung baris dibuka bergantian, jadi bisa turun-naik zig-zag"] = "Row ends open alternately, so you can go up/down in a zig-zag",
-    ["Pakai posisi karakter sebagai pojok kiri-atas"] = "Use character position as top-left corner",
-    ["X awal = kolom karakter, Y baris atas = tile di bawah kaki"] = "Start X = character column, top row Y = tile under the feet",
-    ["Produksi block kalau kurang"] = "Produce blocks if short",
-    ["Tanam & panen seed block itu dulu sampai cukup"] = "Plant & harvest that block's seed first until enough",
-    ["Boleh taruh block pijakan"] = "Allow scaffold blocks",
-    ["Kalau baris paling bawah tidak terjangkau dari tanah"] = "If the bottom row can't be reached from the ground",
-    ["Lanjut Pabrik setelah selesai"] = "Start Factory when finished",
-    -- Pabrik
-    ["Status Pabrik"] = "Factory Status",
-    ["Jalankan Pabrik"] = "Run Factory",
-    ["Break -> tanam -> panen -> break lagi, seed lebihan di-drop"] = "Break -> plant -> harvest -> break again, extra seeds are dropped",
-    ["Seed pabrik"] = "Factory seed",
-    ["Block-nya otomatis (contoh: Dirt Seed -> Dirt)"] = "Block is automatic (example: Dirt Seed -> Dirt)",
-    ["Tanam di seluruh world"] = "Plant in the whole world",
-    ["Mati = hanya di lahan (tab Lahan)"] = "Off = only on the land (Land tab)",
-    ["Pakai posisi sekarang untuk break"] = "Use current position for breaking",
-    ["Berdiri di tempat break, lalu tekan"] = "Stand at the break spot, then press",
-    ["Pilih tile break (Grid)"] = "Select break tiles (Grid)",
-    ["Grid terbuka dalam mode Pabrik (terpisah dari tile Auto Farm)"] = "Grid opens in Factory mode (separate from Auto Farm tiles)",
-    ["Lama 1 sesi break (detik)"] = "Break session length (seconds)",
-    ["Setelah ini cek pohon siap dulu"] = "After this, check for ready trees first",
-    ["Sisakan seed"] = "Seeds to keep",
-    ["Untuk ditanam lagi"] = "For replanting",
-    ["Drop kalau seed sudah"] = "Drop when seeds reach",
-    ["Contoh 200 & sisakan 50 = drop 150"] = "Example 200 & keep 50 = drop 150",
-    ["World drop"] = "Drop world",
-    ["Kosong = world ini | WORLD | WORLD:ID (masuk lewat pintu ID)"] = "Empty = this world | WORLD | WORLD:ID (enter via door ID)",
-    ["Pakai posisi sekarang untuk drop"] = "Use current position for dropping",
-    ["Berdiri di tempat drop (boleh di world lain), lalu tekan"] = "Stand at the drop spot (can be another world), then press",
-    ["Hapus posisi drop"] = "Clear drop position",
-    ["Drop di titik kedatangan (pintu) saja"] = "Drop at the arrival point (door) instead",
-    ["Ada block tapi posisi / tile break belum diatur"] = "Has blocks but break position / tiles are not set",
-    ["Gagal jalan ke posisi break, dicoba lagi nanti"] = "Failed to walk to break position, retrying later",
-    -- Koneksi & config
-    ["Referensi game"] = "Game references",
-    ["Hubungkan ke game"] = "Connect to game",
-    ["Pakai setelah pindah world"] = "Use after changing worlds",
-    ["Simpan pengaturan otomatis, dimuat lagi saat execute"] = "Save settings automatically, loaded again on execute",
-    ["Simpan config sekarang"] = "Save config now",
-    ["Hapus file config, lalu execute ulang"] = "Delete the config file, then re-execute",
-    ["Koreksi posisi X"] = "Position correction X",
-    ["Isi 1 / -1 kalau tile meleset"] = "Enter 1 / -1 if tiles are off",
-    ["Koreksi posisi Y"] = "Position correction Y",
-    ["Masuk lagi & lanjut aktivitas kalau terlempar"] = "Rejoin & resume activity if kicked out",
-    ["Terlempar dari world"] = "Kicked from world",
-    ["World ditutup / di-kick: masuk lagi ke world yang sama"] = "World closed / kicked: rejoin the same world",
-    ["Selalu kembali ke world"] = "Always return to world",
-    ["Kalau berada di luar world (layar pilih world), masuk lagi otomatis"] = "If outside a world (world select screen), rejoin automatically",
-    ["World tujuan"] = "Target world",
-    ["Kosongkan = world terakhir yang kamu masuki"] = "Empty = the last world you entered",
-    ["NAMAWORLD"] = "WORLDNAME",
-    ["Rejoin world sekarang"] = "Rejoin world now",
-    ["Keluar lalu masuk lagi, aktivitas dilanjutkan"] = "Leave and rejoin, activity resumes",
-    ["Disconnect dari server"] = "Disconnected from server",
-    ["Teleport ulang ke game lalu masuk world terakhir"] = "Teleport back to the game and enter the last world",
-    ["Jeda sebelum masuk lagi (detik)"] = "Delay before rejoining (seconds)",
-    ["URL script (untuk rejoin server)"] = "Script URL (for server rejoin)",
-    ["Link raw script ini, supaya jalan lagi setelah teleport. Kosong = pakai autoexec"] =
-        "Raw link of this script, so it runs again after teleport. Empty = use autoexec",
-    ["Sedang proses masuk world, tunggu dulu"] = "Already entering a world, please wait",
-    ["World tujuan belum ada. Isi 'World tujuan' atau masuk world dulu"] = "No target world yet. Fill in 'Target world' or enter a world first",
-    -- Discord
-    ["Notifikasi Discord"] = "Discord Notifications",
-    ["Kirim kabar penting ke channel Discord kamu"] = "Send important updates to your Discord channel",
-    ["URL Webhook"] = "Webhook URL",
-    ["Channel Discord > Edit > Integrasi > Webhook > Salin URL"] = "Discord channel > Edit > Integrations > Webhook > Copy URL",
-    ["Tes kirim"] = "Test send",
-    ["Laporan statistik (menit)"] = "Stats report (minutes)",
-    ["Kirim statistik sesi tiap X menit. 0 = mati"] = "Send session stats every X minutes. 0 = off",
-    ["Mod / Dev / pemain masuk world"] = "Mod / Dev / player entered world",
-    ["Aktivitas berhenti (block habis / error)"] = "Activity stopped (out of blocks / error)",
-    ["Quest diklaim / redeem berhasil"] = "Quest claimed / redeem successful",
-    ["Terlempar / disconnect / masuk lagi"] = "Kicked / disconnected / rejoined",
-    ["Pabrik drop seed / lahan selesai / berhenti"] = "Factory dropped seeds / land done / stopped",
-    ["Isi URL webhook dulu"] = "Fill in the webhook URL first",
-    ["Pesan tes masuk antrian"] = "Test message queued",
-    ["URL webhook tidak valid"] = "Invalid webhook URL",
-    ["Tes notifikasi dari Zekio supreme"] = "Test notification from Zekio supreme",
-    -- pilihan dropdown
-    ["Kiri → Kanan"] = "Left → Right", ["Semua pemain"] = "All players", ["Semua"] = "All",
-    ["Depan"] = "Front", ["Break saja"] = "Break only", ["Place saja"] = "Place only",
-    ["(memuat...)"] = "(loading...)", ["(inventori kosong)"] = "(inventory empty)",
-    ["(inventori belum terbaca)"] = "(inventory not read yet)",
-    ["(inventori kosong / belum terbaca)"] = "(inventory empty / not read yet)",
-    ["Channel chat world belum ada (masuk world dulu)"] = "World chat channel not found (enter a world first)",
-    ["Daftar pesan kosong"] = "Message list is empty",
-    ["Inventori penuh"] = "Inventory full",
-    ["Tanya bahasa saat execute"] = "Ask language on execute",
-    ["Execute ulang untuk ganti bahasa / Re-execute to apply"] = "Re-execute to apply the new language",
-    ["Munculkan pilihan bahasa tiap execute"] = "Show the language choice on every execute",
-    -- Grid
-    ["Grid Tile"] = "Tile Grid", ["Bersihkan pilihan"] = "Clear selection",
-    ["Tile Break Pabrik"] = "Factory Break Tiles", ["START PABRIK"] = "START FACTORY", ["STOP PABRIK"] = "STOP FACTORY",
-}
-
--- Frasa untuk teks yang berubah-ubah (status, notifikasi, pesan Discord)
-I18N.PH = {
-    { "Data world belum ketemu", "World data not found" }, { "Data drop belum ketemu", "Drop data not found" },
-    { "Data pohon belum ketemu", "Tree data not found" }, { "Data pohon tidak ketemu", "Tree data not found" },
-    { "Tekan 'Hubungkan ke game'", "Press 'Connect to game'" }, { "Hubungkan ke game", "Connect to game" },
-    { "Kamu belum masuk world", "You are not in a world yet" }, { "belum masuk world", "not in a world yet" },
-    { "tidak di world", "not in a world" },
-    { "Menunggu karakter / world...", "Waiting for character / world..." },
-    { "Menunggu pohon siap", "Waiting for trees to be ready" }, { "Menunggu", "Waiting" },
-    { "Dihentikan karena", "Stopped because" }, { "Dihentikan", "Stopped" }, { "dimulai", "started" },
-    { "hubungkan ulang ke game", "reconnecting to game" },
-    { "Dijeda Penjaga", "Paused by Guard" }, { "Dijeda", "Paused" }, { "Waspada", "Alert" }, { "Ada:", "Present:" },
-    { "Aman", "Safe" }, { "Pemain di world", "Players in world" }, { "Staff online di server", "Staff online on server" },
-    { "Terdeteksi", "Detected" }, { "kali", "times" }, { "tidak ada", "none" },
-    { "pemain diabaikan", "players ignored" },
-    { "Masuk world", "Entered world" }, { "Keluar world", "Leave world" },
-    { "Masuk lagi dalam", "Rejoining in" }, { "Masuk lagi ke", "Rejoining" }, { "Masuk lagi berhasil", "Rejoined" },
-    { "Masuk lagi", "Rejoin" }, { "Masuk ke", "Entering" }, { "Masih ada", "Still here:" }, { "Keluar lagi", "Leaving again" },
-    { "Sudah keluar world", "Already left the world" }, { "lanjut otomatis mati", "auto resume off" },
-    { "Di luar world", "Outside the world" }, { "Mereka sudah pergi", "They left" }, { "Lanjut dalam", "Resuming in" },
-    { "Sudah aman", "Safe now" }, { "World aman", "World is safe" }, { "World sudah beda", "Different world" },
-    { "aktivitas tidak dilanjutkan", "activity not resumed" }, { "aktivitas dilanjutkan", "activity resumed" },
-    { "aktivitas hanya dijeda", "activity only paused" },
-    { "lanjut aktivitas", "resuming activity" }, { "Lanjut aktivitas", "Resuming activity" },
-    { "Gagal balik ke posisi farm", "Failed to return to farm position" },
-    { "Auto Farm tidak dilanjutkan", "Auto Farm not resumed" },
-    { "Jalan balik ke posisi farm", "Walking back to farm position" },
-    { "Jalan ke posisi break", "Walking to break position" }, { "Jalan ke posisi drop", "Walking to drop position" },
-    { "Cari jalan A* ke", "Finding A* path to" }, { "Jalan ke", "Walking to" }, { "Lompati lubang ke", "Jumping gap to" },
-    { "Lompat ke", "Jumping to" }, { "Turun ke", "Dropping down to" }, { "Naik pakai block ke", "Climbing with block to" },
-    { "Taruh block pijakan", "Placing scaffold block" },
-    { "di bawahnya berbahaya", "dangerous below" }, { "di bawahnya jurang", "pit below" },
-    { "Lewati pijakan", "Skip foothold" }, { "Lewati", "Skip" },
-    { "Pukul", "Hit" }, { "Pecah", "Broke" }, { "Panen", "Harvest" }, { "Tanam", "Plant" },
-    { "Pasang lahan: sisa", "Placing land: remaining" }, { "Pasang", "Place" },
-    { "Gali: sisa", "Digging: remaining" }, { "Gali", "Dig" }, { "Pukul", "Punch" },
-    { "Tile Break Lahan", "Land Break Tiles" }, { "START LAHAN", "START LAND" }, { "STOP LAHAN", "STOP LAND" },
-    { "Semua vending item terpilih sudah kosong", "All vendings of the selected items are empty" },
-    { "semua item yang bisa dijual", "all sellable items" },
-    { " - coba lagi", " - retrying" }, { "Tambah stock gagal:", "Adding stock failed:" },
-    { "Menjauh dari drop sendiri supaya bisa dipungut", "Stepping away from own drops so they can be picked up" },
-    { "Item terpilih sudah habis. Tidak diambil (bukan item terpilih):", "Selected items are empty. Not taken (not selected):" },
-    { "Hapus pilihan item untuk ambil semua", "Clear the item selection to take everything" }, { "Cek ulang isi vending...", "Re-checking vending contents..." },
-    { "Daftar item gagal dimuat:", "Item list failed to load:" }, { "tidak terbaca", "not readable" },
-    { "Vending milikmu di", "Your vendings in" },
-    { "Jalan ke posisi drop vending", "Walking to the vending drop position" },
-    { "Tidak bisa jalan ke posisi drop vending", "Can't reach the vending drop position" },
-    { "Tas penuh: atur titik drop vending (WORLD / WORLD:ID / simpan posisi XY)", "Backpack full: set the vending drop point (WORLD / WORLD:ID / save XY position)" },
-    { "Daftar item:", "Item list:" }, { "Item dipilih:", "Item selected:" },
-    { "Pegang dulu block / seed di tas game (bukan tool)", "Hold a block / seed in the game backpack first (not a tool)" },
-    { "Pilihan item dihapus: semua item", "Item selection cleared: all items" },
-    { "Posisi drop vending", "Vending drop position" }, { "Posisi drop vending dihapus", "Vending drop position cleared" },
-    { "(titik kedatangan)", "(arrival point)" }, { "dropdown belum dibuat", "dropdown not created yet" },
-    { "refresh gagal", "refresh failed" }, { "tas", "bag" },
-    { "Vending item terpilih penuh / belum ada yang menjual item terpilih", "Vendings of the selected items are full / none sells them yet" },
-    { "Fungsi animasi game tidak ketemu (tekan 'Hubungkan ke game')", "Game animation function not found (press 'Connect to game')" },
-    { "Animasi", "Animation" }, { "(belum ada item)", "(no items yet)" }, { "| jenis:", "| type:" },
-    { ": semua |", ": all |" }, { "jenis: Semua", "type: All" },
-    { "Block saja", "Blocks only" }, { "Seed saja", "Seeds only" },
-    { "Posisi break produksi", "Production break position" }, { "otomatis", "automatic" },
-    { "kanan karakter, dekat ujung baris", "right of the character, near the row end" },
-    { "grid lahan", "land grid" }, { "posisi break lahan", "land break position" },
-    { "Ke vending", "To vending" }, { "): tambah", "): add" }, { "): ambil", "): take" },
-    { "Gagal tambah stock di", "Failed to add stock at" }, { "Tidak bisa ke vending", "Can't reach vending" },
-    { "Semua vending penuh / belum ada vending yang menjual item", "All vendings full / none sells an item yet" },
-    { "Menunggu drop baru di", "Waiting for new drops in" }, { "untuk isi stock", "to restock" },
-    { "Pergi ke titik drop", "Going to drop point" }, { "Gagal ke titik drop", "Failed to reach drop point" },
-    { "Semua vending sudah kosong", "All vendings are empty" }, { "Ambil", "Take" },
-    { "Selesai, ada vending yang gagal diambil", "Done, some vendings could not be emptied" },
-    { "Vending kosong, tapi drop gagal", "Vendings empty, but dropping failed" },
-    { "Tas penuh oleh item lain, kosongkan tas dulu", "Backpack is full of other items, clear it first" },
-    { "Drop gagal", "Drop failed" }, { "Tambah stock gagal terus", "Adding stock keeps failing" },
-    { "Gagal pulang ke world vending", "Failed to return to the vending world" },
-    { "ambil drop", "to pick drops" },
-    { "Tas penuh: atur titik drop vending (WORLD atau WORLD:ID)", "Backpack full: set the vending drop point (WORLD or WORLD:ID)" },
-    { "Tidak ada vending milikmu di world ini (jalankan di world vending)", "No vending of yours in this world (run it in the vending world)" },
-    { "Fungsi vending game tidak ketemu", "Game vending function not found" },
-    { "milikmu di world ini | isi", "yours in this world | stocked" }, { "kosong", "empty" },
-    { "diambil", "taken" },
-    { "tile gali belum terjangkau, dicoba lagi", "dig tiles not reachable yet, retrying" },
-    { "tile gali dilewati", "dig tiles skipped" }, { "Bersihkan drop di lahan", "Cleaning up drops on the land" },
-    { "Ambil drop block sisa galian", "Picking up leftover dug blocks" },
-    { "Bersihkan drop sisa galian (per baris)", "Cleaning up leftover dug drops (row by row)" },
-    { "Ambil drop sisa di lahan (per baris)", "Picking up leftover drops on the land (row by row)" },
-    { "Bersihkan drop di lahan (per baris)", "Cleaning up drops on the land (row by row)" },
-    { "Bersihkan drop baris y", "Cleaning drops on row y" },
-    { "Block habis, produksi 1 baris dulu", "Out of blocks, producing on 1 row first" },
-    { "lanjut pasang", "resuming placing" }, { "sisakan", "keep" }, { "baris y", "row y" },
-    { "Jalan ke posisi pasang-pecah", "Walking to the place-break spot" },
-    { "Naik tangga ke", "Climbing stairs to" }, { "belum terjangkau, dilewati sebentar", "not reachable yet, skipped for a while" },
-    { "Tidak ada baris lahan (cek X awal / X akhir / Y baris atas)", "No land rows (check start X / end X / top row Y)" },
-    { "Belum ada baris lengkap", "No complete row yet" }, { "seed-nya tidak ketemu", "its seed was not found" },
-    { "celah, tangga, background", "gaps, stairs, background" }, { "selesai", "done" },
-    { "Produksi block", "Producing blocks" }, { "total butuh", "total needed" },
-    { "Lahan selesai", "Land finished" }, { "Block cukup", "Enough blocks" }, { "mulai pasang", "starting to place" },
-    { "Block habis, masih kurang", "Out of blocks, still short" }, { "Seed & block habis", "Seeds & blocks used up" },
-    { "tidak ada pohon tumbuh", "no trees growing" }, { "Butuh", "Need" }, { "Seed habis", "Out of seeds" },
-    { "seed-nya tidak ketemu", "its seed was not found" }, { "Block kurang", "Blocks short" },
-    { "Sisa tile belum terjangkau / terhalang, dicoba lagi", "Remaining tiles unreachable / blocked, retrying" },
-    { "Lahan penuh, menunggu", "Land is full, waiting" }, { "Bukan di world pabrik", "Not in the factory world" },
-    { "menunggu...", "waiting..." }, { "Pergi ke", "Going to" }, { "untuk drop", "to drop" }, { "Pulang ke", "Returning to" },
-    { "Gagal pulang ke world pabrik", "Failed to return to factory world" }, { "Drop gagal", "Drop failed" },
-    { "tidak bisa drop di posisi ini", "can't drop at this position" },
-    { "tidak bisa jalan ke posisi drop", "can't walk to the drop position" },
-    { "Posisi drop belum diatur", "Drop position not set" }, { "drop dilewati", "drop skipped" },
-    { "Posisi drop dihapus", "Drop position cleared" }, { "Posisi drop", "Drop position" }, { "Posisi break", "Break position" },
-    { "di posisi pabrik", "at the factory position" }, { "Pabrik berhenti", "Factory stopped" },
-    { "Bangun Lahan", "Build Land" }, { "Pabrik", "Factory" }, { "Penjaga", "Guard" }, { "Lahan", "Land" },
-    { "Gagal masuk lagi ke", "Failed to rejoin" }, { "Gagal masuk", "Failed to enter" }, { "Gagal keluar world", "Failed to leave world" },
-    { "Dicoba lagi nanti", "Will retry later" }, { "dicoba lagi", "retrying" },
-    { "Gagal splice", "Splice failed" }, { "ditolak server", "rejected by server" }, { "Splice jadi", "Spliced into" },
-    { "Menunggu tile Grid kosong (panen dulu pohonnya)", "Waiting for empty Grid tiles (harvest the trees first)" },
-    { "Seed A habis, tidak ada pohon A yang bisa di-splice", "Seed A used up, no A trees to splice" },
-    { "tidak ada tempat tanam / pohon untuk di-splice", "no planting spot / tree to splice" },
-    { "Karakter tidak ditemukan (keluar world?)", "Character not found (left the world?)" },
-    { "di inventori habis", "in inventory is used up" }, { "Auto Farm berhenti", "Auto Farm stopped" },
-    { "Auto Clear berhenti", "Auto Clear stopped" }, { "Farmer berhenti", "Farmer stopped" },
-    { "Inventori penuh", "Inventory full" }, { "tidak bisa diambil lagi", "can't be picked up anymore" },
-    { "Laporan statistik", "Stats report" }, { "Quest diklaim", "Quest claimed" }, { "Redeem berhasil", "Redeem successful" },
-    { "Redeem gagal", "Redeem failed" }, { "Terlempar dari world", "Kicked from world" }, { "Terlempar dari", "Kicked from" },
-    { "Kembali otomatis", "Auto return" }, { "berhasil", "succeeded" },
-    { "Rejoin: menunggu masuk", "Rejoin: waiting to enter" }, { "Rejoin: gagal masuk", "Rejoin: failed to enter" },
-    { "Disconnect dari server", "Disconnected from server" }, { "script tidak di-queue", "script not queued" },
-    { "Berhasil masuk lagi", "Rejoined" }, { "World tujuan", "Target world" },
-    { "Mode diganti, nyalakan lagi", "Mode changed, turn it on again" }, { "World sudah bersih!", "World is clean!" },
-    { "Block pijakan belum dipilih / habis: jalan tanpa block pijakan", "Scaffold block not selected / empty: moving without scaffold" },
-    { "Auto Harvest tidak bisa cek pohon siap", "Auto Harvest can't check ready trees" },
-    { "Aktifkan Auto Harvest atau Auto Plant", "Enable Auto Harvest or Auto Plant" },
-    { "Pilih seed dulu untuk Auto Plant", "Select a seed for Auto Plant first" },
-    { "Pilih seed pabrik dulu", "Select a factory seed first" }, { "Block dari seed ini tidak ketemu", "Block for this seed not found" },
-    { "Atur lahan dulu", "Set up the land first" }, { "Pilih block padat untuk lahan", "Select a solid block for the land" },
-    { "Pilih Seed A dan Seed B dulu", "Select Seed A and Seed B first" }, { "Seed A dan Seed B harus beda", "Seed A and Seed B must differ" },
-    { "Kombinasi ini tidak bisa di-splice", "This combination can't be spliced" },
-    { "Pilih tile dulu di Grid Tile", "Select tiles in the Tile Grid first" }, { "Pilih block dari inventori", "Select a block from inventory" },
-    { "Hentikan Auto Farm / Clear / Farmer dulu", "Stop Auto Farm / Clear / Farmer first" },
-    { "atau nyalakan Keliling world", "or turn on Roam world" },
-    { "Kontrol gerak game (WorldMenu.isDown) tidak ketemu", "Game movement control (WorldMenu.isDown) not found" },
-    { "Fungsi pukul game belum ketemu", "Game punch function not found" },
-    { "Seed habis: atur posisi & tile break di tab Pabrik supaya bisa dapat seed", "Out of seeds: set break position & tiles in the Factory tab to get seeds" },
-    { "Config dihapus. Execute ulang untuk default", "Config deleted. Re-execute for defaults" },
-    { "Config dimuat", "Config loaded" }, { "Belum ada config", "No config yet" }, { "Tersimpan", "Saved" },
-    { "Executor tidak bisa simpan file", "Executor can't save files" }, { "Executor tidak bisa hapus file", "Executor can't delete files" },
-    { "Executor tidak punya fungsi request", "Executor has no request function" },
-    { "Gagal simpan file", "Failed to save file" }, { "Gagal hapus file", "Failed to delete file" },
-    { "Gagal kirim", "Failed to send" }, { "Terkirim", "Sent" }, { "Antrian", "Queue" },
-    { "Gagal buka", "Failed to open" }, { "Gagal", "Failed" },
-    -- label status
-    { "BERHENTI", "STOPPED" }, { "JALAN", "RUNNING" }, { "fase", "phase" }, { "PANEN", "HARVEST" }, { "TANAM", "PLANT" },
-    { "TUNGGU", "WAIT" }, { "TIDAK terbaca (harvest mati)", "NOT readable (harvest off)" }, { "terbaca", "readable" },
-    { "TIDAK", "NO" }, { "cadangan", "fallback" }, { "Inventori", "Inventory" }, { "Posisi", "Position" },
-    { "Karakter", "Character" }, { "Aksi", "Action" }, { "Baris", "Row" }, { "Pohon", "Trees" }, { "Pijakan", "Scaffold" },
-    { "Pemain", "Players" }, { "belum dipilih", "not selected" }, { "belum diatur", "not set" }, { "ditolak", "rejected" },
-    { "Bentuk", "Shape" }, { "baris", "rows" }, { "jarak", "spacing" }, { "tangga", "stairs" }, { "punya", "have" },
-    { "butuh", "need" }, { "kurang", "short" }, { "cukup", "enough" }, { "Terpasang", "Placed" },
-    { "terhalang block lain", "blocked by other blocks" }, { "Celah tanam terisi block", "Planting gaps filled with blocks" },
-    { "bersihkan dulu", "clear it first" }, { "Celah tanam: bersih", "Planting gaps: clear" }, { "Seed block", "Block seed" },
-    { "Hasil", "Result" }, { "panen", "harvest" }, { "tanam", "plant" }, { "di-drop", "dropped" }, { "sisakan", "keep" },
-    { "drop saat", "drop at" }, { "world ini", "this world" }, { "pintu", "door" }, { "Lama sesi", "Session time" },
-    { "Block pecah", "Blocks broken" }, { "Block di-place", "Blocks placed" }, { "Drop diambil", "Drops collected" },
-    { "Item terbanyak", "Top items" }, { "Selesai", "Done" }, { "diklaim script", "claimed by script" },
-    { "Quest baru dalam", "New quests in" }, { "Quest belum bisa diambil", "Quests not available yet" },
-    { "Gagal ambil quest", "Failed to get quests" }, { "Gagal ambil daftar code", "Failed to get code list" },
-    { "Pesan terakhir", "Last message" }, { "Cek lagi dalam", "Checking again in" }, { "detik", "seconds" },
-    { "Auto klaim mati", "Auto claim off" }, { "Code aktif", "Active codes" }, { "sudah ditukar", "redeemed" },
-    { "ditukar script", "redeemed by script" }, { "Auto redeem mati", "Auto redeem off" },
-    { "Redeem sedang ditutup", "Redeem is closed" }, { "Block depan", "Front blocks" }, { "tumpukan", "piles" },
-    { "siap panen", "ready" }, { "tumbuh", "growing" }, { "Scan terakhir", "Last scan" }, { "siap", "ready" },
-    { "berikut", "next" }, { "Tidak ada yang cocok", "No matches" }, { "Kosong", "Empty" }, { "Tidak ada pohon", "No trees" },
-    { "item lain", "more items" }, { "jenis lain", "more types" }, { "pakai Cari item", "use Search item" },
-    { "(pohon)", "(tree)" }, { "Di-recycle", "Recycled" }, { "Item dipilih", "Items selected" }, { "Ditanam", "Planted" },
-    { "tidak bisa di-splice", "can't be spliced" }, { "Pilih Seed A dan Seed B", "Select Seed A and Seed B" },
-    { "Menghitung...", "Calculating..." }, { "Mulai...", "Starting..." }, { "Lanjut aktivitas...", "Resuming activity..." },
-    { "data pemain belum ketemu", "player data not found" }, { "belum ketemu", "not found" },
-    { "tidak ketemu", "not found" }, { "ketemu", "found" }, { "tekan", "press" },
-    { "tidak ada block padat di inventori", "no solid blocks in inventory" },
-    { "tidak ada seed di inventori", "no seeds in inventory" }, { "tidak ada pohon", "no trees" },
-    { "tidak ada tempat tanam", "no planting spot" },
-    { "Y baris atas", "top row Y" }, { "baris atas", "top row" }, { "Y awal", "start Y" }, { "X awal", "start X" },
-    { "jumlah baris", "row count" }, { "masuk lagi dalam", "rejoining in" }, { "masuk ke", "entering" },
-    { "dalam", "in" }, { "Executor tidak punya", "Executor has no" },
-    { "tidak bisa dijangkau / dipecah", "can't be reached / broken" }, { "Sisa", "Remaining" },
-    { "dilewati, coba ulang", "skipped, retrying" }, { "Gagal membaca pengaturan", "Failed to read settings" },
-    { "balasan kosong", "empty reply" }, { "fungsi drop game tidak ketemu", "game drop function not found" },
-    { "fungsi masuk world tidak ketemu", "game enter-world function not found" },
-    { "fungsi splice game tidak ketemu", "game splice function not found" },
-    { "gagal masuk", "failed to enter" }, { "nama world tidak diketahui", "unknown world name" },
-    { "tidak bisa ke server", "can't reach the server" }, { "tunggu", "wait" },
-    { "world penuh / dikunci / gagal", "world full / locked / failed" }, { "aman", "safe" }, { "Fase", "Phase" },
-    { "Titik drop belum diatur (tab Titik Drop), drop dilewati", "Drop point not set (Drop Point tab), drop skipped" },
-    { "Ambil hasil panen...", "Picking up harvest..." }, { "Lanjut Auto Farm", "Resuming Auto Farm" },
-    { "Auto Farm dihentikan", "Auto Farm stopped" }, { "Gagal pulang ke world farmer", "Failed to return to farmer world" },
-    { "Gagal pulang ke world farm", "Failed to return to farm world" },
-    { "Sesi break tanpa aksi: cek posisi & tile break (dicoba lagi 1 menit)",
-        "Break session had no action: check break position & tiles (retry in 1 minute)" },
-    { "pohon siap belum terjangkau, dicoba lagi", "ready trees not reachable yet, retrying" },
-    { "Seed hampir penuh", "Seeds almost full" },
-    { "atur titik drop & nyalakan Auto drop seed", "set a drop point & turn on Auto drop seed" },
-    { "Pasang & pecah", "Place & break" }, { "untuk dapat seed", "to get seeds" },
-    { "Seed habis & tidak ada tempat pasang-pecah di samping karakter",
-        "Out of seeds & no spot beside the character to place and break" },
-    { "Tidak ada tempat tanam, menunggu", "No planting spot, waiting" },
-    { "drop di titik ini tidak di-collect lagi", "drops at this point are not collected again" },
-    { "titik kedatangan", "arrival point" }, { "hasil panen", "harvest" }, { "sisakan seed", "keep seeds" },
-    { "Dipakai", "Used by" }, { "Di-drop", "Dropped" }, { "Catatan", "Note" }, { "Titik", "Point" },
-    { "Produksi", "Production" }, { "Drop seed", "Seed drop" },
-    { "Tidak ada baris yang muat (Y atas terlalu bawah). Berdiri di pojok kiri-ATAS lahan lalu tekan 'Pakai posisi karakter'",
-        "No rows fit (top Y too low). Stand at the TOP-LEFT corner of the land, then press 'Use character position'" },
-    { "tidak ada baris yang muat (Y atas terlalu bawah)", "no rows fit (top Y too low)" },
-    { "berdiri di pojok kiri-atas lalu tekan 'Pakai posisi karakter'", "stand at the top-left corner, then press 'Use character position'" },
-    { "Tidak bisa ke awal lahan", "Can't reach the land start" }, { "Pecah anak tangga", "Breaking stair step" },
-    { "Pasang anak tangga", "Placing stair step" }, { "Turun ke anak tangga", "Stepping down to stair step" },
-    { "Bersihkan tile lahan", "Clearing land tile" }, { "Ambil drop", "Picking up drop" },
-    { "1 kosong per baris, tangga kiri & kanan", "1 gap per row, stairs on left & right" },
-    { "titik drop belum diatur", "drop point not set" }, { "otomatis saat", "automatic at" },
-    { "Dipakai: Pabrik (seed), Farmer & Auto Farm (otomatis saat item ~190)",
-        "Used by: Factory (seeds), Farmer & Auto Farm (automatic when an item reaches ~190)" },
-    { "saat", "at" },
-    { "Mati", "Off" }, { "mati", "off" }, { "pohon siap", "trees ready" }, { "pohon", "trees" },
-    { "di-recycle", "recycled" }, { "di-splice", "spliced" }, { "di-place", "placed" }, { "di-queue", "queued" }, { "habis", "used up" }, { "dan", "and" }, { "atau", "or" }, { "dari", "from" }, { "untuk", "for" },
-    { "sudah", "already" }, { "belum", "not yet" }, { "lagi", "again" }, { "di", "at" }, { "ke", "to" },
-}
-
--- Pola tambahan (format waktu "1j 2m 3d" -> "1h 2m 3s", "/jam" -> "/hour")
-I18N.RAW = {
-    { "(%d+)j (%d+)m (%d+)d", "%1h %2m %3s" },
-    { "(%d+)m (%d+)d", "%1m %2s" },
-    { "(%d+)j (%d+)m", "%1h %2m" },
-    { "/jam", "/hour" },
-    { "(%d+) dtk", "%1 s" },
-}
-
-function I18N.prep()
-    local list = {}
-    for _, p in ipairs(I18N.PH) do
-        if p[1] ~= p[2] then
-            local pat = p[1]:gsub("[%^%$%(%)%%%.%[%]%*%+%-%?]", "%%%0")
-            if p[1]:match("^%w") then pat = "%f[%w]" .. pat end
-            if p[1]:match("%w$") then pat = pat .. "%f[%W]" end
-            list[#list + 1] = { pat, (p[2]:gsub("%%", "%%%%")), #p[1] }
-        end
-    end
-    table.sort(list, function(a, b) return a[3] > b[3] end)
-    I18N.list = list
-end
-
--- Terjemahkan teks (kalau bahasa = English)
-function I18N.T(s)
-    if I18N.Lang ~= "en" or type(s) ~= "string" or s == "" then return s end
-    local e = I18N.EN[s]
-    if e then return e end
-    if not I18N.list then I18N.prep() end
-    for _, r in ipairs(I18N.list) do s = s:gsub(r[1], r[2]) end
-    for _, r in ipairs(I18N.RAW) do s = s:gsub(r[1], r[2]) end
-    return s
-end
-
--- Teks pilihan dropdown: hanya terjemahan utuh (nama item game tidak diubah)
-function I18N.V(s)
-    if I18N.Lang ~= "en" or type(s) ~= "string" then return s end
-    return I18N.EN[s] or s
-end
-
--- Bungkus objek WindUI: judul, deskripsi, pilihan dropdown & isi status ikut diterjemahkan
-I18N.Backs = setmetatable({}, { __mode = "k" })
-
-local function mapList(list, back)
-    local out = {}
-    for i, val in ipairs(list) do
-        local tr = I18N.V(val)
-        out[i] = tr
-        if type(tr) == "string" then back[tr] = val end
-    end
-    return out
-end
-
-function I18N.wrap(obj)
-    if I18N.Lang ~= "en" or type(obj) ~= "table" then return obj end
-    return setmetatable({}, {
-        __index = function(_, k)
-            local v = obj[k]
-            if type(v) ~= "function" then return v end
-            return function(_, cfg, ...)
-                local back
-                if k == "Dropdown" and type(cfg) == "table" then
-                    back = {}
-                    if type(cfg.Values) == "table" then cfg.Values = mapList(cfg.Values, back) end
-                    if type(cfg.Value) == "string" then
-                        cfg.Value = I18N.V(cfg.Value)
-                    elseif type(cfg.Value) == "table" then
-                        cfg.Value = mapList(cfg.Value, back)
-                    end
-                    local cb = cfg.Callback
-                    if cb then
-                        -- tampil dalam English, callback tetap terima teks asli
-                        cfg.Callback = function(opt, ...)
-                            if type(opt) == "string" then
-                                opt = back[opt] or opt
-                            elseif type(opt) == "table" then
-                                local o2 = {}
-                                for i, x in ipairs(opt) do o2[i] = back[x] or x end
-                                opt = o2
-                            end
-                            return cb(opt, ...)
-                        end
-                    end
-                elseif (k == "Refresh" or k == "Select") and I18N.Backs[obj] then
-                    local b = I18N.Backs[obj]
-                    if type(cfg) == "table" then
-                        cfg = mapList(cfg, b)
-                    elseif type(cfg) == "string" then
-                        cfg = I18N.V(cfg)
-                    end
-                end
-                if type(cfg) == "table" and k ~= "Refresh" and k ~= "Select" and cfg[1] == nil then
-                    for _, f in ipairs({ "Title", "Desc", "Placeholder", "Content" }) do
-                        if type(cfg[f]) == "string" then cfg[f] = I18N.T(cfg[f]) end
-                    end
-                elseif type(cfg) == "string" and (k == "SetDesc" or k == "SetTitle") then
-                    cfg = I18N.T(cfg)
-                end
-                local r = v(obj, cfg, ...)
-                if back and type(r) == "table" then I18N.Backs[r] = back end
-                if type(r) == "table" and r ~= obj then return I18N.wrap(r) end
-                return r
-            end
-        end,
-    })
-end
-end)() end
-
-local function notify(title, content, dur)
-    task.defer(function()
-        pcall(function()
-            WindUI:Notify({ Title = I18N.T(title), Content = I18N.T(content), Duration = dur or 3, Icon = "info" })
-        end)
-    end)
-end
-
----------------------------------------------------------------------
--- CONFIG: simpan & muat pengaturan otomatis
----------------------------------------------------------------------
--- Cara kerja:
---   1. Saat execute, file config dibaca lalu nilainya dipasang ke pengaturan
---      SEBELUM UI dibuat, jadi tombol & slider langsung tampil sesuai config.
---   2. Tiap 3 detik pengaturan sekarang dibandingkan dengan yang terakhir disimpan.
---      Ada yang berubah -> langsung disimpan (auto save).
---   3. File per akun: workspace/KzoyzOpus/config_<UserId>.json
---   Yang tidak disimpan: tombol jalan (Auto Farm / Clear / Farmer / Chat), fly & inf jump.
-local Config = {
-    AutoSave = true,
-    Paused = false,      -- true setelah reset (supaya file tidak dibuat lagi)
-    Folder = "KzoyzOpus",
-    Data = {},           -- isi file saat execute
-    List = {},           -- tabel pengaturan yang disimpan
-    LastJson = nil,
-    Status = "-",
-}
-
-do (function() -- fungsi sendiri: variabel di dalam tidak ikut batas 200 local
-    local HttpService = game:GetService("HttpService")
-    local canFile = type(writefile) == "function" and type(readfile) == "function" and type(isfile) == "function"
-    Config.CanFile = canFile
-    Config.Path = Config.Folder .. "/config_" .. tostring(LocalPlayer.UserId) .. ".json"
-
-    local function read()
-        if not canFile then return nil end
-        local okE, exists = pcall(isfile, Config.Path)
-        if not okE or not exists then return nil end
-        local okR, raw = pcall(readfile, Config.Path)
-        if not okR or type(raw) ~= "string" then return nil end
-        local okD, data = pcall(HttpService.JSONDecode, HttpService, raw)
-        if okD and type(data) == "table" then return data end
-        return nil
-    end
-
-    local loaded = read()
-    Config.Found = loaded ~= nil
-    Config.Data = loaded or {}
-    if Config.Data.AutoSave == false then Config.AutoSave = false end
-    Config.Status = Config.Found and "Config dimuat" or (canFile and "Belum ada config" or "Executor tidak bisa simpan file")
-
-    -- Daftarkan tabel pengaturan. Nilai dari file langsung dipasang
-    -- (kecuali key di 'later', dipasang sendiri setelah terhubung ke game).
-    function Config.add(name, tbl, keys, later)
-        table.insert(Config.List, { name = name, tbl = tbl, keys = keys })
-        local saved = Config.Data[name]
-        if type(saved) ~= "table" then return end
-        for _, k in ipairs(keys) do
-            local v, cur = saved[k], tbl[k]
-            if v ~= nil and not (later and later[k]) and (cur == nil or type(v) == type(cur)) then
-                tbl[k] = v
-            end
-        end
-    end
-
-    function Config.saved(name, key)
-        local t = Config.Data[name]
-        return type(t) == "table" and t[key] or nil
-    end
-
-    local function collect()
-        local out = { AutoSave = Config.AutoSave, Version = 1 }
-        for _, e in ipairs(Config.List) do
-            local t = {}
-            for _, k in ipairs(e.keys) do t[k] = e.tbl[k] end
-            out[e.name] = t
-        end
-        return out
-    end
-
-    function Config.save(force)
-        if not canFile then
-            Config.Status = "Executor tidak bisa simpan file"
-            return false
-        end
-        if Config.Paused and not force then return false end
-        local okJ, json = pcall(HttpService.JSONEncode, HttpService, collect())
-        if not okJ then
-            Config.Status = "Gagal membaca pengaturan"
-            return false
-        end
-        if not force and json == Config.LastJson then return true end
-        if type(isfolder) == "function" and type(makefolder) == "function" then
-            local okF, has = pcall(isfolder, Config.Folder)
-            if okF and not has then pcall(makefolder, Config.Folder) end
-        end
-        local ok = pcall(writefile, Config.Path, json)
-        if ok then
-            Config.LastJson = json
-            Config.Paused = false
-            Config.Status = "Tersimpan " .. os.date("%H:%M:%S")
-        else
-            Config.Status = "Gagal simpan file"
-        end
-        return ok
-    end
-
-    -- Hapus file config (execute ulang = kembali ke default)
-    function Config.reset()
-        Config.Paused = true
-        Config.LastJson = nil
-        if canFile and type(delfile) == "function" then
-            local ok = pcall(delfile, Config.Path)
-            Config.Status = ok and "Config dihapus. Execute ulang untuk default" or "Gagal hapus file"
-            return ok
-        end
-        Config.Status = "Executor tidak bisa hapus file"
-        return false
-    end
-
-    function Config.start()
-        -- tandai kondisi sekarang sebagai "sudah tersimpan" kalau sama dengan file
-        if Config.Found then
-            local okJ, json = pcall(HttpService.JSONEncode, HttpService, collect())
-            if okJ then Config.LastJson = json end
-        end
-        task.spawn(function()
-            while alive() do
-                task.wait(3)
-                if Config.AutoSave and alive() then Config.save(false) end
-            end
-        end)
-    end
-end)() end
-
-Config.add("Farm", State, {
-    "Mode", "PlaceMs", "BreakMs", "AfterBreakMs", "HitsOverride", "SelectedId", "Offsets",
-    "CalibX", "CalibY", "AntiAfk", "MutePunch", "Visual", "LiteMode", "AutoCollect", "MultiTarget",
-    "CollectAround", "CollectRadius", "CollectMode",
-})
-Config.add("Clear", Clear, { "UseBlock", "ScaffoldId", "Collect", "Sweep" })
-Config.add("Farmer", Farmer, {
-    "Harvest", "Plant", "Collect", "UseBlock", "ScaffoldId", "HarvestMs", "PlantMs", "SeedId",
-})
--- update 1084: game memberi jeda minimal antar aksi (place ~0.135 dtk, pukul ~0.19 dtk)
-State.PlaceMs = math.max(State.PlaceMs, 140)
-State.BreakMs = math.max(State.BreakMs, 200)
-Farmer.HarvestMs = math.max(Farmer.HarvestMs, 140)
-Farmer.PlantMs = math.max(Farmer.PlantMs, 140)
-Config.add("Misc", Misc, { "Speed" })
-Config.add("Chat", Spam, { "Texts", "IntervalSec" })
-Config.add("Lahan", Land, { "X0", "X1", "Y0" })
-Config.add("Bangun", Build, { "BlockId", "ThenPabrik", "BreakX", "BreakY", "Tiles" })
-Config.add("Vending", Vend, { "Mode", "Point", "Items", "DropX", "DropY" })
-Config.add("Pabrik", Pabrik, {
-    "SeedId", "WholeWorld", "Tiles", "BreakX", "BreakY",
-    "Drop", "Keep", "DropAt", "DropWorld", "DropX", "DropY",
-})
-Config.add("Bahasa", I18N, { "Saved", "Ask" })
-I18N.Lang = (I18N.Saved == "en") and "en" or "id"
-
----------------------------------------------------------------------
--- STATISTIK SESI & NOTIFIKASI DISCORD (data; tampilan ada di tab Statistik / Discord)
----------------------------------------------------------------------
-local Stats = { T0 = os.clock(), Gems0 = nil, Items = {}, Base = {} }
-
--- Cara kerja webhook:
---   Hook.send(jenis, teks) memasukkan pesan ke antrian.
---   Antrian dikirim satu per satu tiap 2.5 detik (supaya tidak kena batas Discord).
-local Hook = {
-    On = false,
-    Url = "",
-    Penjaga = true,   -- mod / dev / pemain masuk world
-    Stop = true,      -- aktivitas berhenti (block habis, error)
-    Full = true,      -- inventori penuh
-    Bonus = true,     -- quest diklaim / redeem berhasil
-    Rejoin = true,    -- terlempar / masuk lagi
-    Pabrik = true,    -- pabrik drop / lahan selesai / berhenti
-    ReportMin = 0,    -- laporan statistik tiap X menit (0 = mati)
-    Queue = {},
-    LastFull = {},
-    Status = "-",
-}
-
-do (function()
-    local HttpService = game:GetService("HttpService")
-
-    local function requester()
-        return (syn and syn.request) or (http and http.request) or http_request or request
-            or (fluxus and fluxus.request)
-    end
-
-    function Hook.valid(url)
-        url = tostring(url or "")
-        for _, host in ipairs({ "discord.com", "discordapp.com", "ptb.discord.com", "canary.discord.com" }) do
-            if string.sub(url, 1, #host + 22) == "https://" .. host .. "/api/webhooks/" then return true end
-        end
-        return false
-    end
-
-    -- jenis: "penjaga" | "stop" | "full" | "bonus" | "rejoin" | "report" | "test"
-    function Hook.send(kind, text)
-        if not Hook.On or not Hook.valid(Hook.Url) then return end
-        local allow = kind == "test" or kind == "report"
-            or (kind == "penjaga" and Hook.Penjaga) or (kind == "stop" and Hook.Stop)
-            or (kind == "full" and Hook.Full) or (kind == "bonus" and Hook.Bonus)
-            or (kind == "rejoin" and Hook.Rejoin) or (kind == "pabrik" and Hook.Pabrik)
-        if not allow or #Hook.Queue >= 20 then return end
-        table.insert(Hook.Queue, I18N.T(tostring(text)))
-    end
-
-    task.spawn(function()
-        while alive() do
-            local text = table.remove(Hook.Queue, 1)
-            if not text then
-                task.wait(0.5)
-            else
-                local req = requester()
-                if not req then
-                    Hook.Status = "Executor tidak punya fungsi request"
-                else
-                    local body = HttpService:JSONEncode({
-                        username = "Zekio supreme",
-                        content = ("**[%s]** %s"):format(LocalPlayer.Name, text),
-                    })
-                    local ok, res = pcall(req, {
-                        Url = Hook.Url, Method = "POST",
-                        Headers = { ["Content-Type"] = "application/json" }, Body = body,
-                    })
-                    local code = ok and type(res) == "table" and tonumber(res.StatusCode or res.Status) or nil
-                    if ok and (code == nil or code < 300) then
-                        Hook.Status = "Terkirim " .. os.date("%H:%M:%S")
-                    else
-                        Hook.Status = "Gagal kirim (" .. tostring(code or res) .. ")"
-                    end
-                end
-                task.wait(2.5)
-            end
-        end
-    end)
-end)() end
-
----------------------------------------------------------------------
--- CARI DATA & FUNGSI GAME (getgc)
----------------------------------------------------------------------
-local getconsts = (debug and debug.getconstants) or getconstants
-local getUpvalues -- dipakai juga oleh pencarian inventori sebelum bagian Auto Collect
-
--- Fungsi place game: satu-satunya yang memakai "placedAt" + "flips" sekaligus.
--- Kirimnya "tile" (game baru, ByteNet) atau "SetTile" (game lama).
-local function isSetTileFn(fn)
-    if not getconsts then return false end
-    if islclosure and not islclosure(fn) then return false end
-    local ok, consts = pcall(getconsts, fn)
-    if not ok or type(consts) ~= "table" then return false end
-    local hasSend, hasPlaced, hasFlips = false, false, false
-    for _, c in pairs(consts) do
-        if c == "tile" or c == "SetTile" then hasSend = true
-        elseif c == "placedAt" then hasPlaced = true
-        elseif c == "flips" then hasFlips = true end
-    end
-    return hasSend and hasPlaced and hasFlips
-end
-
--- Fungsi pukul game: teks "Empty the Vending Machine first!" + "newCrack"
--- (game lama: "HarvestProvider")
-local function isPunchFn(fn)
-    if not getconsts then return false end
-    if islclosure and not islclosure(fn) then return false end
-    local ok, consts = pcall(getconsts, fn)
-    if not ok or type(consts) ~= "table" then return false end
-    local hasVend, hasMark = false, false
-    for _, c in pairs(consts) do
-        if c == "Empty the Vending Machine first!" then hasVend = true
-        elseif c == "newCrack" or c == "HarvestProvider" then hasMark = true end
-    end
-    return hasVend and hasMark
-end
-
--- Fungsi game yang menggambar tangan karakter saat memukul / memasang
-function Anim.isArmFn(fn)
-    if not getconsts then return false end
-    if islclosure and not islclosure(fn) then return false end
-    local ok, consts = pcall(getconsts, fn)
-    if not ok or type(consts) ~= "table" then return false end
-    local a, b, c = false, false, false
-    for _, k in pairs(consts) do
-        if k == "forearm" then a = true
-        elseif k == "heldReach" then b = true
-        elseif k == "punchReach" then c = true end
-    end
-    return a and b and c
-end
-
--- Cari nomor upvalue "aksi terakhir" (tabel {t, x, y, facing} atau nil) di fungsi tangan.
--- Upvalue ini dipakai bersama oleh kode input & gambar karakter game, jadi cukup diganti sekali.
-function Anim.bind(fn)
-    local gu = (debug and debug.getupvalue) or getupvalue
-    local su = (debug and debug.setupvalue) or setupvalue
-    if not (gu and su) then return false end
-    local vals, last = {}, 0
-    for i = 1, 16 do
-        local ok, v = pcall(gu, fn, i)
-        if not ok then break end
-        vals[i] = v
-        if v ~= nil then last = i end
-    end
-    for i = 1, last - 1 do
-        local v = vals[i]
-        if v == nil or (type(v) == "table" and rawget(v, "t") ~= nil and rawget(v, "facing") ~= nil) then
-            Anim.fn, Anim.idx, Anim.set = fn, i, su
-            return true
-        end
-    end
-    return false
-end
-
-local function isStateHolder(v)
-    local fn = rawget(v, "state")
-    if type(fn) ~= "function" then return false end
-    local ok, s = pcall(fn)
-    return ok and type(s) == "table" and type(s.x) == "number" and type(s.y) == "number"
-        and s.facing ~= nil and s.vx ~= nil
-end
-
--- Pastikan fungsi milik game, bukan milik script ini
-local function isGameFn(fn)
-    if fn == isSetTileFn or fn == isPunchFn then return false end
-    if isexecutorclosure then
-        local ok, res = pcall(isexecutorclosure, fn)
-        if ok and res then return false end
-    end
-    -- Fungsi game juga bisa berada di Shared / PlayerScripts. Nama source bukan
-    -- bukti bahwa fungsi itu bukan milik game; cocokkan sidik fungsi di bawah.
-    return true
-end
-
-function Refs.member(v, key)
-    local ok, value = pcall(function() return v[key] end)
-    if ok then return value end
-end
-
-function Refs.inventorySlots(v)
-    if type(v) ~= "table" then return nil end
-    -- slots boleh diwariskan lewat __index, bukan hanya field mentah pada tabel.
-    local slots = Refs.member(v, "slots")
-    return type(slots) == "table" and slots or nil
-end
-
--- require() dari executor tidak selalu memberi objek modul yang identik dengan
--- require() milik game. Terima kontrak inventori yang sama tanpa menyamakan closure.
-function Refs.inventoryOK(v)
-    if v == InventoryModule or not Refs.inventorySlots(v) then return false end
-    local count = Refs.member(v, "count")
-    if type(count) ~= "function" then return false end
-    local ok, mt = pcall(getmetatable, v)
-    if ok and type(mt) == "table" and (mt == InventoryModule or rawget(mt, "__index") == InventoryModule) then
-        return true
-    end
-    if count == Refs.member(InventoryModule, "count") then return true end
-    -- Jangan menerima tabel {slots = ...} saja (misalnya config atau daftar UI).
-    return type(Refs.member(v, "add")) == "function"
-        and type(Refs.member(v, "remove")) == "function"
-        and type(Refs.member(v, "room")) == "function"
-end
-
--- Telusuri referensi dengan batas ukuran/kedalaman, tanpa memanggil metode yang
--- mengubah isi tas. Ini juga bekerja ketika getgc() tidak mengekspos tabel game.
-function Refs.findInventory(roots, limit)
-    limit = limit or 1200
-    local queue, seen, cursor = {}, {}, 1
-    local found = Refs.inventoryOK(Refs.Inv) and Refs.Inv or nil
-    local source = found and Refs.InvSource or nil
-    local keys = { "inventory", "Inventory", "inv", "Inv", "backpack", "Backpack",
-        "bag", "Bag", "data", "Data", "state", "State", "openBackpack", "ui" }
-    local function push(value, depth, label)
-        local kind = type(value)
-        if (kind ~= "table" and kind ~= "function") or seen[value] or #queue >= limit then return end
-        if value == G or value == _G or value == Refs or value == UI or value == Session
-            or value == State or value == ItemDB or value == InventoryModule then return end
-        if kind == "function" and not isGameFn(value) then return end
-        seen[value] = true
-        queue[#queue + 1] = { value = value, depth = depth, label = label }
-    end
-    for _, root in ipairs(roots) do push(root.value, 0, root.label) end
-    while cursor <= #queue do
-        local entry = queue[cursor]
-        cursor = cursor + 1
-        local value, depth = entry.value, entry.depth
-        if type(value) == "table" then
-            if not found and Refs.inventoryOK(value) then found, source = value, entry.label end
-            if not Refs.World and type(rawget(value, "fg")) == "table"
-                and type(rawget(value, "bg")) == "table" and type(rawget(value, "w")) == "number"
-                and type(rawget(value, "h")) == "number" and rawget(value, "spawn") ~= nil then
-                Refs.World = value
-            end
-            if found and Refs.World then return found, source, "objek " .. tostring(cursor - 1) end
-            if depth < 5 then
-                -- Field bernama didahulukan supaya objek UI besar tidak memenuhi antrian.
-                for _, key in ipairs(keys) do
-                    push(rawget(value, key), depth + 1, entry.label .. "." .. key)
-                end
-                local count = 0
-                for key, child in next, value do
-                    count = count + 1
-                    if count > 64 then break end
-                    -- Grid tile / isi slot bukan pemilik inventori dan bisa sangat besar.
-                    if key ~= "_G" and key ~= "_ENV" and key ~= "fg" and key ~= "bg"
-                        and key ~= "slots" and key ~= "live" and key ~= "free" then
-                        push(child, depth + 1, entry.label)
-                    end
-                end
-                local ok, mt = pcall(getmetatable, value)
-                if ok and type(mt) == "table" then push(rawget(mt, "__index"), depth + 1, entry.label) end
-            end
-        elseif depth < 5 and getUpvalues then
-            for _, upvalue in pairs(getUpvalues(value)) do
-                push(upvalue, depth + 1, entry.label .. ".upvalue")
-            end
-        end
-        if cursor % 100 == 0 then task.wait() end
-    end
-    local canRead = (debug and (type(debug.getupvalues) == "function" or type(debug.getupvalue) == "function"))
-        or type(getupvalues) == "function" or type(getupvalue) == "function"
-    return found, source, "objek " .. tostring(cursor - 1) .. "; upvalue " .. (canRead and "tersedia" or "tidak tersedia")
-end
-
-function Refs.inventoryFn(fn)
-    if not getconsts then return true end
-    local ok, constants = pcall(getconsts, fn)
-    if not ok or type(constants) ~= "table" then return false end
-    for _, key in pairs(constants) do
-        if key == "slots" or key == "inventory" or key == "Inventory"
-            or key == "backpack" or key == "Backpack" or key == "openBackpack" then return true end
-    end
-    return false
-end
-
-function Refs.inventoryEntries()
-    local inv = Refs.Inv
-    local slots = Refs.inventorySlots(inv)
-    if not Refs.inventoryOK(inv) or type(slots) ~= "table" then
-        Refs.InvError = "Data inventori belum ditemukan (deteksi r2); rincian pencarian ada di tab Koneksi"
-        return {}
-    end
-    Refs.InvError = nil
-    local out = {}
-    -- pairs tetap membaca slot setelah lubang / indeks 0; ipairs berhenti di lubang pertama.
-    for _, slot in pairs(slots) do
-        if type(slot) == "table" then
-            local id, n = tonumber(slot.id), tonumber(slot.n)
-            if id and id >= 0 and id < math.huge and id % 1 == 0 and n and n > 0 and n < math.huge then
-                out[#out + 1] = { id = id, n = n }
-            end
-        end
-    end
-    return out
-end
-
-local function findRefs()
-    -- Periksa kemampuan scan sebelum menghapus hasil quickRefs yang sudah berhasil.
-    if type(getgc) ~= "function" then
-        Refs.ScanErr = "Executor tidak punya getgc()"
-        return false, Refs.ScanErr
-    end
-    local okGC, objects = pcall(getgc, true)
-    if not okGC or type(objects) ~= "table" then
-        Refs.ScanErr = "Scan game gagal: " .. tostring(objects)
-        return false, Refs.ScanErr
-    end
-    Refs.ScanErr = nil
-    local previousInv = Refs.inventoryOK(Refs.Inv) and Refs.Inv or nil
-    local previousSource = Refs.InvSource
-    local inventoryRoots = {}
-    Refs.World, Refs.Inv, Refs.SetTile, Refs.State, Refs.Punch, Refs.Menu = nil, nil, nil, nil, nil, nil
-    Refs.StateOwner = nil
-    Refs.InvSource = nil
-    Refs.Gems = nil
-    Refs.Hud = nil
-    Refs.Others = nil
-    Refs.Arm = nil
-    Refs.Particles = {}
-    Anim.Particles = nil
-    for _, v in pairs(objects) do
-        local tv = type(v)
-        if tv == "table" then
-            if not Refs.World then
-                local ok, isWorld = pcall(function()
-                    return type(rawget(v, "fg")) == "table" and type(rawget(v, "bg")) == "table"
-                        and type(rawget(v, "w")) == "number" and type(rawget(v, "h")) == "number"
-                        and rawget(v, "spawn") ~= nil
-                end)
-                if ok and isWorld then Refs.World = v end
-            end
-            if not Refs.Inv then
-                if Refs.inventoryOK(v) then
-                    Refs.Inv, Refs.InvSource = v, "getgc"
-                elseif #inventoryRoots < 160 and (rawget(v, "inventory") or rawget(v, "Inventory")
-                    or rawget(v, "inv") or rawget(v, "backpack")) then
-                    inventoryRoots[#inventoryRoots + 1] = { value = v, label = "data game" }
-                end
-            end
-            if not Refs.State then
-                local ok, isHolder = pcall(isStateHolder, v)
-                if ok and isHolder then Refs.State, Refs.StateOwner = rawget(v, "state"), v end
-            end
-            if not Refs.Menu then
-                local ok, isMenu = pcall(function()
-                    return type(rawget(v, "openBackpack")) == "function" and type(rawget(v, "ui")) == "table"
-                end)
-                if ok and isMenu then Refs.Menu = v end
-            end
-            if not Refs.Gems then
-                local ok, isG = pcall(function() return type(rawget(v, "addGems")) == "function" end)
-                if ok and isG then Refs.Gems = v end
-            end
-            if not Refs.Hud then
-                local ok, isH = pcall(function()
-                    return type(rawget(v, "punchRange")) == "function" and type(rawget(v, "handPower")) == "function"
-                end)
-                if ok and isH then Refs.Hud = v end
-            end
-            if not Refs.Others then
-                -- data pemain lain: punya list(), where(), playerAt()
-                local ok, isO = pcall(function()
-                    return type(rawget(v, "list")) == "function" and type(rawget(v, "where")) == "function"
-                        and type(rawget(v, "playerAt")) == "function"
-                end)
-                if ok and isO then Refs.Others = v end
-            end
-            if ParticlesOk then
-                local ok, isP = pcall(function()
-                    return getmetatable(v) == ParticlesModule and type(rawget(v, "live")) == "table"
-                        and type(rawget(v, "free")) == "table"
-                end)
-                if ok and isP then table.insert(Refs.Particles, v) end
-            end
-        elseif tv == "function" and isGameFn(v) then
-            if not Refs.SetTile and isSetTileFn(v) then
-                Refs.SetTile = v
-            elseif not Refs.Punch and isPunchFn(v) then
-                Refs.Punch = v
-            end
-            if not Refs.Inv and #inventoryRoots < 160 and Refs.inventoryFn(v) then
-                inventoryRoots[#inventoryRoots + 1] = { value = v, label = "fungsi game" }
-            end
-        end
-        if Refs.World and Refs.Inv and Refs.SetTile and Refs.State and Refs.Punch
-            and Refs.Menu and Refs.Gems and Refs.Hud and Refs.Others then break end
-    end
-    if not Refs.Inv then
-        table.insert(inventoryRoots, 1, { value = Refs.World, label = "world" })
-        table.insert(inventoryRoots, 1, { value = Refs.Menu, label = "menu" })
-        table.insert(inventoryRoots, 1, { value = MenuModOk and MenuModule or nil, label = "WorldMenu" })
-        Refs.Inv, Refs.InvSource, Refs.InvScanInfo = Refs.findInventory(inventoryRoots)
-    end
-    if not Refs.Inv and previousInv then Refs.Inv, Refs.InvSource = previousInv, previousSource end
-    return Refs.World ~= nil
-end
-
-local function refsText()
-    return "World: " .. (Refs.World and "OK" or "TIDAK")
-        .. " | Inventori: " .. (Refs.inventoryOK(Refs.Inv) and "OK" or "TIDAK")
-        .. " | setTile: " .. (Refs.SetTile and "OK" or "cadangan")
-        .. " | Posisi: " .. (Refs.State and "OK" or "cadangan")
-        .. " | Pukul: " .. (Refs.Punch and "OK" or "TIDAK")
-        .. " | Drop: " .. (Drops.list and "OK" or "TIDAK")
-        .. " | Pohon: " .. (Refs.Trees and "OK" or "TIDAK")
-        .. " | Pemain: " .. (Refs.Others and "OK" or "TIDAK")
-        .. " | Animasi: " .. (Anim.fn and "OK" or "TIDAK")
-        .. " | Dropdown: " .. (UI.DropErr and ("ERROR " .. tostring(UI.DropErr))
-            or (not Refs.inventoryOK(Refs.Inv) and "menunggu inventori") or (UI.DropOk and "OK" or "-"))
-        .. "\nDeteksi inventori r2: " .. tostring(Refs.InvSource or Refs.InvScanInfo or "-")
-        .. (Refs.InvError and ("\nInventori: " .. Refs.InvError) or "")
-        .. (Refs.InvWatchErr and ("\nEvent inventori: " .. Refs.InvWatchErr) or "")
-        .. (Refs.ScanErr and ("\nScan: " .. Refs.ScanErr) or "")
-end
-
----------------------------------------------------------------------
--- ITEM & INVENTORI
----------------------------------------------------------------------
-local function itemName(id)
-    local it = ItemDB[id]
-    return (it and it.name) or ("Item #" .. tostring(id))
-end
-
-local function invCount(id)
-    if not Refs.Inv then return 0 end
-    local ok, n = pcall(function() return Refs.Inv:count(id) end)
-    n = ok and tonumber(n) or nil
-    if n and n >= 0 and n < math.huge then return n end
-    local total = 0
-    for _, slot in ipairs(Refs.inventoryEntries()) do
-        if slot.id == tonumber(id) then total = total + slot.n end
-    end
-    return total
-end
-
-local function isPlaceable(id)
-    local it = ItemDB[id]
-    if not it then return false end
-    if it.kind == "tool" or it.kind == "cloth" or it.kind == "clothes" or it.kind == "consumable" then
-        return false
-    end
-    if it.lock or it.area then return false end
-    return true
-end
-
-local function placeableIds()
-    local ids, seen = {}, {}
-    for _, slot in ipairs(Refs.inventoryEntries()) do
-        if not seen[slot.id] and isPlaceable(slot.id) then
-            seen[slot.id] = true
-            ids[#ids + 1] = slot.id
-        end
-    end
-    table.sort(ids)
-    return ids
-end
-
-local function inventoryLabels(ids)
-    local out = {}
-    for _, id in ipairs(ids or placeableIds()) do
-        out[#out + 1] = string.format("%s [%d]", itemName(id), id)
-    end
-    if #out == 0 then out = { "(inventori kosong / belum terbaca)" } end
-    return out
-end
-
--- Dropdown cuma di-refresh kalau jenis item berubah (biar tidak lag)
-local lastInvSig = nil
-local invRefreshPending = false
-
-local lastSeedSig = nil
-local lastBlockSig = nil
-
--- Seed di inventori (untuk Farmer)
-local function seedIds()
-    local ids, seen = {}, {}
-    for _, slot in ipairs(Refs.inventoryEntries()) do
-        local it = ItemDB[slot.id]
-        if it and it.kind == "seed" and not seen[slot.id] then
-            seen[slot.id] = true
-            ids[#ids + 1] = slot.id
-        end
-    end
-    table.sort(ids)
-    return ids
-end
-
--- Setelah daftar di-refresh, pilih lagi item yang sedang dipakai (dari config / pilihan lama)
-local function selectSaved(dd, labels, id)
-    if not dd or not id then return true end
-    local want = "[" .. tostring(id) .. "]"
-    for _, label in ipairs(labels) do
-        if string.sub(label, -#want) == want then
-            local ok, err = UI.exec(function() dd:Select(label) end)
-            if not ok then UI.DropErr = "Pilih item: " .. tostring(err) end
-            return ok
-        end
-    end
-    return true
-end
-
--- Refresh 1 dropdown; error dicatat (tampil di tab Koneksi)
-function UI.ddRefresh(dd, labels)
-    if not dd then return true end
-    local ok, err = UI.exec(function() dd:Refresh(labels) end)
-    if ok then
-        UI.DropOk = os.clock()
-    else
-        UI.DropErr = ("%s (id %s/%s)"):format(tostring(err), tostring(UI.ident()), tostring(Session.Ident))
-        UI.DropErrAt = os.clock()
-    end
-    return ok, err
-end
-
-local function doInvRefresh(force)
-    UI.DropErr = nil
-    if not Refs.inventoryOK(Refs.Inv) then
-        if Anim.quickRefs then pcall(Anim.quickRefs) end
-        if not Refs.inventoryOK(Refs.Inv) then findRefs() end
-        if UI.watchInventory then UI.watchInventory() end
-    end
-    if Vend.refreshItems and not Vend.Running then pcall(Vend.refreshItems, false) end
-    local ids = placeableIds()
-    local sig = table.concat(ids, ",")
-    if force or sig ~= lastInvSig then
-        local labels = inventoryLabels(ids)
-        local ok = UI.ddRefresh(UI.InvDropdown, labels)
-        if ok then ok = selectSaved(UI.InvDropdown, labels, State.SelectedId) end
-        lastInvSig = ok and sig or nil
-    end
-    local sids = seedIds()
-    local ssig = table.concat(sids, ",")
-    if force or ssig ~= lastSeedSig then
-        local labels = {}
-        for _, id in ipairs(sids) do
-            labels[#labels + 1] = string.format("%s [%d]", itemName(id), id)
-        end
-        if #labels == 0 then labels = { "(tidak ada seed di inventori)" } end
-        local ok = UI.ddRefresh(UI.SeedDropdown, labels)
-        if ok then ok = selectSaved(UI.SeedDropdown, labels, Farmer.SeedId) end
-        if UI.PabrikSeedDropdown then
-            local pok = UI.ddRefresh(UI.PabrikSeedDropdown, labels)
-            if pok then pok = selectSaved(UI.PabrikSeedDropdown, labels, Pabrik.SeedId) end
-            ok = ok and pok
-        end
-        lastSeedSig = ok and ssig or nil
-    end
-    -- block padat untuk pijakan
-    local bids = {}
-    for _, id in ipairs(ids) do
-        local it = ItemDB[id]
-        if it and it.solid and it.kind ~= "seed" then bids[#bids + 1] = id end
-    end
-    local bsig = table.concat(bids, ",")
-    if force or bsig ~= lastBlockSig then
-        local labels = {}
-        for _, id in ipairs(bids) do
-            labels[#labels + 1] = string.format("%s [%d]", itemName(id), id)
-        end
-        if #labels == 0 then labels = { "(tidak ada block padat di inventori)" } end
-        local ok = true
-        for _, entry in ipairs({
-            { dd = UI.ClearBlockDropdown, id = Clear.ScaffoldId },
-            { dd = UI.FarmerBlockDropdown, id = Farmer.ScaffoldId },
-            { dd = UI.BuildBlockDropdown, id = Build.BlockId },
-        }) do
-            local refreshed = UI.ddRefresh(entry.dd, labels)
-            if refreshed then refreshed = selectSaved(entry.dd, labels, entry.id) end
-            ok = ok and refreshed
-        end
-        lastBlockSig = ok and bsig or nil
-    end
-    -- daftar Splice & Tas (dibuat di bagian bawah script)
-    if UI.SpliceRefresh then
-        local ok, err = pcall(UI.SpliceRefresh, force)
-        if not ok then UI.DropErr = "Splice: " .. tostring(err) end
-    end
-    if UI.TrashRefresh then
-        local ok, err = pcall(UI.TrashRefresh, force)
-        if not ok then UI.DropErr = "Tas: " .. tostring(err) end
-    end
-end
-
-function UI.checkInventory(force, silent)
-    local ok, err = pcall(doInvRefresh, force)
-    if not ok then UI.DropErr = tostring(err) end
-    if UI.RefInfo then pcall(function() UI.RefInfo:SetDesc(refsText()) end) end
-    local why = Refs.InvError or UI.DropErr
-    if why then
-        warn("[Zekio supreme] inventori: " .. tostring(why))
-        if force and not silent then notify("Inventori", tostring(why), 6) end
-    end
-    return ok and why == nil, why
-end
-
-local function refreshInvDropdown(force)
-    if force then UI.InvForce = true end
-    if not force and invRefreshPending then return end
-    invRefreshPending = true
-    UI.later("inv", function()
-        invRefreshPending = false
-        local f = UI.InvForce == true
-        UI.InvForce = false
-        if alive() then UI.checkInventory(f) end
-    end, force and 0 or 0.3)
-end
-
-local invConn
-local function watchInventory()
-    if invConn then pcall(function() invConn:Disconnect() end) end
-    invConn = nil
-    Refs.InvWatchErr = nil
-    if not Refs.Inv then return end
-    local ok, err = pcall(function()
-        local signal = Refs.Inv.changed
-        if typeof(signal) == "Instance" then signal = signal.Event end
-        if not signal or type(signal.Connect) ~= "function" then
-            error("Event changed tidak tersedia; gunakan Refresh daftar")
-        end
-        invConn = signal:Connect(function()
-            if alive() then refreshInvDropdown(false) end
-        end)
-    end)
-    if ok and invConn then
-        table.insert(Connections, invConn)
-    elseif not ok then
-        Refs.InvWatchErr = tostring(err)
-    end
-end
-UI.watchInventory = watchInventory
-
----------------------------------------------------------------------
--- WORLD: tile & posisi karakter
----------------------------------------------------------------------
-local function tileAt(layer, x, y)
-    local w = Refs.World
-    if not w or x < 0 or y < 0 or x >= w.w or y >= w.h then return nil end
-    local grid = w[layer]
-    local row = grid and grid[y]
-    return row and (row[x] or 0) or nil
-end
-
-local function getView()
-    local gg = PlayerGui:FindFirstChild("GameGui")
-    local cam = gg and gg:FindFirstChild("World") and gg.World:FindFirstChild("Camera")
-    local tiles = cam and cam:FindFirstChild("Tiles")
-    local pv = cam and cam:FindFirstChild("PlayerView")
-    if not (tiles and pv) then return nil end
-    local sample = tiles:FindFirstChildWhichIsA("ImageLabel")
-    if not sample or sample.AbsoluteSize.X <= 0 then return nil end
-    return { tiles = tiles, pv = pv, ts = sample.AbsoluteSize.X }
-end
-
-local function getPlayerTile()
-    if Refs.State then
-        local ok, s = pcall(Refs.State)
-        if ok and type(s) == "table" and type(s.x) == "number" then
-            if s.active == false then return nil end
-            return math.floor(s.x) + State.CalibX, math.floor(s.y - 0.475) + State.CalibY
-        end
-    end
-    local v = getView()
-    if not v then return nil end
-    local center = v.pv.AbsolutePosition + v.pv.AbsoluteSize / 2
-    local rel = center - v.tiles.AbsolutePosition
-    return math.floor(rel.X / v.ts) + State.CalibX, math.floor(rel.Y / v.ts) + State.CalibY
-end
-
--- Tile, block & mode Auto Farm yang dipakai sekarang (Pabrik memakai miliknya sendiri)
-local function farmOffsets()
-    local o = State.Override
-    return (o and o.offsets) or State.Offsets
-end
-local function farmBlock()
-    local o = State.Override
-    if o then return o.block end
-    return State.SelectedId
-end
-local function farmMode()
-    local o = State.Override
-    return (o and o.mode) or State.Mode
-end
-
-local function sortedOffsets()
-    local list = {}
-    for key in pairs(farmOffsets()) do
-        local dx, dy = string.match(key, "^(-?%d+),(-?%d+)$")
-        table.insert(list, { dx = tonumber(dx), dy = tonumber(dy) })
-    end
-    table.sort(list, function(a, b)
-        if a.dy ~= b.dy then return a.dy < b.dy end
-        return a.dx < b.dx
-    end)
-    return list
-end
-
----------------------------------------------------------------------
--- AKSI DASAR: place & pukul
----------------------------------------------------------------------
-local function sendSetTile(layer, x, y, id)
-    if id ~= 0 and State.Visual and Anim.place then Anim.place(x, y, id) end
-    if Refs.SetTile then
-        local ok, err = pcall(Refs.SetTile, layer, x, y, id, false, false)
-        if ok then return true end
-        warn("[Zekio supreme] setTile game gagal, pakai remote langsung: " .. tostring(err))
-    end
-    if NetOk and type(Net) == "table" and type(Net.tile) == "table" then
-        -- sama seperti game: layer 1 = fg, 2 = bg
-        local ok = pcall(Net.tile.send, {
-            layer = (layer == "bg") and 2 or 1, x = x, y = y, id = id, flip = false,
-        })
-        if not ok then return false end
-    elseif SetTileRemote then
-        SetTileRemote:FireServer(layer, x, y, id, false)
-    else
-        return false
-    end
-    local grid = Refs.World and Refs.World[layer]
-    if grid and grid[y] then grid[y][x] = id end
-    return true
-end
-
-local function sendHitFx(x, y)
-    if NetOk and type(Net) == "table" and Net.act then
-        pcall(Net.act.send, { x = x + 0.5, y = y + 0.5 })
-    end
-end
-
-local function hitsNeeded(id)
-    if State.HitsOverride > 0 then return State.HitsOverride end
-    local it = ItemDB[id]
-    if not it then return 4 end
-    local h = (it.kind == "seed") and 20 or it.hits
-    return tonumber(h) or 4
-end
-
-local function canBreak(id)
-    if id == 0 then return false end
-    local it = ItemDB[id]
-    if not it then return true end
-    if it.lock or it.area or it.vend or it.display then return false end
-    local h = (it.kind == "seed") and 20 or it.hits
-    return h == nil or h > 0
-end
-
--- Game abaikan pukulan ke tile yang baru di-place (< 0.3 detik)
-local PLACE_GUARD = 0.32
-
--- Place 1 tile kalau kosong. Hasil: "place" / "habis" / nil
-local function tryPlace(x, y)
-    local sel = farmBlock()
-    if not sel then return nil end
-    local fg = tileAt("fg", x, y)
-    if fg == nil then return nil end
-    local bg = tileAt("bg", x, y)
-    local it = ItemDB[sel]
-    local layer = (it and it.background) and "bg" or "fg"
-    local cur = (layer == "bg") and bg or fg
-    if not (cur == 0 and (layer == "bg" or fg == 0)) then return nil end
-    if invCount(sel) <= 0 then return "habis" end
-
-    sendSetTile(layer, x, y, sel)
-    if Refs.Inv then pcall(function() Refs.Inv:remove(sel, 1) end) end
-    local key = x .. "," .. y
-    HitCount[key] = nil
-    PlacedAt[key] = os.clock()
-    State.Placed += 1
-    State.LastAction = "Place " .. itemName(sel) .. " (" .. x .. "," .. y .. ")"
-    return "place"
-end
-
--- Masih ada yang bisa dipecah di tile ini? (block depan / background)
-local function breakableAt(x, y)
-    local fg = tileAt("fg", x, y)
-    if fg == nil then return false end
-    if fg ~= 0 then return canBreak(fg) end
-    local bg = tileAt("bg", x, y)
-    return State.BreakBackground and bg ~= nil and bg ~= 0 and canBreak(bg)
-end
-
--- Pukul 1 kali. Hasil: "hit" / "broke" / nil
--- includeBg = ikut pecah background
-local function tryBreak(x, y, includeBg)
-    if includeBg == nil then includeBg = State.BreakBackground end
-    local key = x .. "," .. y
-    local fg = tileAt("fg", x, y)
-    if fg == nil then return nil end
-    local bg = tileAt("bg", x, y)
-    local layer, id
-    if fg ~= 0 then
-        layer, id = "fg", fg
-    elseif includeBg and bg ~= 0 then
-        layer, id = "bg", bg
-    end
-    if not layer or not canBreak(id) then return nil end
-
-    -- tunggu sebentar kalau tile baru di-place
-    local t = PlacedAt[key]
-    if t then
-        local age = os.clock() - t
-        if age < PLACE_GUARD then task.wait(PLACE_GUARD - age) end
-        PlacedAt[key] = nil
-    end
-
-    if Refs.Punch then
-        local ok, err = pcall(Refs.Punch, x, y, State.MutePunch or nil, nil)
-        if not ok then
-            State.LastAction = "Error pukul: " .. tostring(err)
-            return nil
-        end
-        if State.Visual then Anim.swing(x, y, "punch") end
-        if tileAt(layer, x, y) ~= id then
-            Drops.brokeAt[key] = os.clock()
-            State.Broken += 1
-            State.LastAction = "Break " .. itemName(id) .. " (" .. x .. "," .. y .. ")"
-            return "broke"
-        end
-        State.LastAction = "Pukul " .. itemName(id) .. " (" .. x .. "," .. y .. ")"
-        return "hit"
-    end
-
-    -- Cadangan: hitung pukulan sendiri
-    local hc = HitCount[key]
-    if not hc or hc.id ~= id or hc.layer ~= layer then
-        hc = { id = id, layer = layer, n = 0 }
-        HitCount[key] = hc
-    end
-    hc.n += 1
-    sendHitFx(x, y)
-    if State.Visual then Anim.swing(x, y, "punch") end
-    local need = hitsNeeded(id)
-    if hc.n >= need then
-        sendSetTile(layer, x, y, 0)
-        HitCount[key] = nil
-        Drops.brokeAt[key] = os.clock()
-        State.Broken += 1
-        State.LastAction = "Break " .. itemName(id) .. " (" .. x .. "," .. y .. ")"
-        return "broke"
-    end
-    State.LastAction = "Pukul " .. itemName(id) .. " " .. hc.n .. "/" .. need
-    return "hit"
-end
-
----------------------------------------------------------------------
--- AUTO COLLECT
----------------------------------------------------------------------
--- Cara game: World.takeDrop(uid, jumlah) -> server balas jumlahnya -> masuk inventori.
--- Game cuma ambil drop yang disentuh badan; di sini drop diambil langsung.
-local TakeDropRemote = WorldRemotes:FindFirstChild("TakeDrop") -- game lama saja
-
--- Fungsi tangan game dipanggil dari fungsi gambar yang terhubung ke RenderStepped:
--- cukup periksa upvalue fungsi-fungsi itu (jauh lebih ringan dari scan getgc).
-function Anim.findFast()
-    if not getconnections or Anim.fn then return Anim.fn ~= nil end
-    for _, name in ipairs({ "RenderStepped", "Heartbeat", "PreRender", "Stepped" }) do
-        local okS, sig = pcall(function() return RunService[name] end)
-        if okS and sig then
-            local ok, conns = pcall(getconnections, sig)
-            if ok and type(conns) == "table" then
-                for _, c in ipairs(conns) do
-                    local okf, fn = pcall(function() return c.Function end)
-                    if okf and type(fn) == "function" then
-                        for _, u in pairs(getUpvalues(fn)) do
-                            if type(u) == "function" and Anim.isArmFn(u) then
-                                Refs.Arm = u
-                                return Anim.bind(u)
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end
-    return false
-end
-
--- Cari data world & isi tas dari WorldMenu dan callback gambar/input game.
--- Telusuri juga tabel di dalam upvalue; maks 800 objek, tanpa getgc.
-function Anim.quickRefs()
-    if Refs.inventoryOK(Refs.Inv) and Refs.World then return true end
-    local roots = {
-        { value = MenuModOk and MenuModule or nil, label = "WorldMenu" },
-        { value = Refs.Menu, label = "menu" },
-        { value = Refs.World, label = "world" },
-    }
-    if type(getconnections) == "function" then
-        for _, service in ipairs({
-            { object = RunService, names = { "RenderStepped", "Heartbeat", "PreRender", "Stepped" } },
-            { object = UserInputService, names = { "InputBegan", "InputEnded" } },
-        }) do
-            for _, name in ipairs(service.names) do
-                local okS, sig = pcall(function() return service.object[name] end)
-                if okS and sig then
-                    local ok, conns = pcall(getconnections, sig)
-                    if ok and type(conns) == "table" then
-                        for _, c in ipairs(conns) do
-                            local okf, fn = pcall(function() return c.Function end)
-                            if okf and type(fn) == "function" then
-                                roots[#roots + 1] = { value = fn, label = name }
-                            end
-                            if #roots >= 100 then break end
-                        end
-                    end
-                end
-            end
-        end
-    end
-    local inv, source, info = Refs.findInventory(roots, 800)
-    Refs.Inv, Refs.InvSource, Refs.InvScanInfo = inv, source, info
-    return Refs.inventoryOK(Refs.Inv)
-end
-
-function getUpvalues(fn)
-    local all = (debug and debug.getupvalues) or getupvalues
-    if type(all) == "function" then
-        local ok, ups = pcall(all, fn)
-        if ok and type(ups) == "table" then return ups end
-    end
-    local out = {}
-    local gu = (debug and debug.getupvalue) or getupvalue
-    if type(gu) == "function" then
-        for i = 1, 60 do
-            local result = table.pack(pcall(gu, fn, i))
-            if not result[1] or result.n < 2 then break end
-            -- Executor: value. Lua-compatible API: name, value (termasuk value nil).
-            if result.n >= 3 and type(result[2]) == "string" then out[i] = result[3]
-            else out[i] = result[2] end
-        end
-    end
-    return out
-end
-
-function Drops.record(d)
-    if type(d) ~= "table" then return false end
-    local uidType = type(d.uid)
-    if uidType ~= "number" and uidType ~= "string" then return false end
-    if (uidType == "number" and (d.uid ~= d.uid or math.abs(d.uid) == math.huge))
-        or (uidType == "string" and d.uid == "") then return false end
-    for _, key in ipairs({ "id", "x", "y", "n" }) do
-        local value = d[key]
-        if type(value) ~= "number" or value ~= value or math.abs(value) == math.huge then return false end
-    end
-    return d.n >= 0 and d.id >= 0 and d.id % 1 == 0
-end
-
-function Drops.snapshot(list)
-    local out = {}
-    list = list or Drops.list
-    if type(list) == "table" then
-        for _, d in pairs(list) do
-            if Drops.record(d) then out[#out + 1] = d end
-        end
-    end
-    return out
-end
-
-function Drops.key(list, drop)
-    for key, value in pairs(list or {}) do
-        if rawequal(value, drop) then return key end
-    end
-end
-
-function Drops.fail(message)
-    Drops.Status, Drops.LastError = message, message
-end
-
--- Tabel kosong hanya sah dari getter drop milik world. Upvalue kosong bisa saja
--- cache lain: dahulu tabel itu diterima lebih dulu dan collect tidak melihat drop.
-local function isDropList(t, allowEmpty)
-    if type(t) ~= "table" or t == Refs.World or t == Refs.Inv then return false end
-    if next(t) == nil then return allowEmpty == true end
-    for _, d in pairs(t) do
-        if Drops.record(d) then return true end
-    end
-    return false
-end
-
--- deep = true: boleh pakai getgc (berat, bisa bikin lag / crash di HP) -> hanya dari tombol "Hubungkan ke game"
-local function findDropRefs(deep)
-    -- 0) fungsi game World.dropList(): daftar drop yang sama untuk semua world (paling ringan)
-    local w0 = Refs.World
-    local dl = w0 and rawget(w0, "dropList")
-    if type(dl) == "function" then
-        local okl, l = pcall(dl)
-        if okl and isDropList(l, true) then
-            if Drops.list ~= l then Drops.update = nil end
-            Drops.list = l
-            Drops.Source = "World.dropList"
-            -- v5.9.0: fungsi update (kurangi / hapus drop) juga wajib dicari. Dulu langsung
-            -- return di sini, jadi Drops.update kosong -> drop hasil mode Remote tidak dihapus.
-            if not Drops.update then Drops.findUpdate() end
-            return true
-        end
-    end
-    if Drops.list and not deep then return true end -- yang lama masih dipakai
-    Drops.list, Drops.update, Drops.Source = nil, nil, nil
-    -- 1) dari fungsi World.dropTaken (isinya: daftar drop + fungsi update)
-    local wd = Refs.World and rawget(Refs.World, "dropTaken")
-    if type(wd) == "function" then
-        for _, u in pairs(getUpvalues(wd)) do
-            if not Drops.list and isDropList(u) then
-                Drops.list = u
-                Drops.Source = "World.dropTaken"
-            end
-        end
-    end
-    -- 2) dari handler DropTaken game
-    local ev = WorldRemotes:FindFirstChild("DropTaken")
-    if not Drops.list and ev and getconnections then
-        local ok, conns = pcall(getconnections, ev.OnClientEvent)
-        if ok and type(conns) == "table" then
-            for _, c in ipairs(conns) do
-                local okf, fn = pcall(function() return c.Function end)
-                if okf and type(fn) == "function" then
-                    for _, u in pairs(getUpvalues(fn)) do
-                        if not Drops.list and isDropList(u) then
-                            Drops.list = u
-                            Drops.Source = "DropTaken event"
-                        end
-                    end
-                end
-                if Drops.list then break end
-            end
-        end
-    end
-    -- 3) cadangan: cari lewat getgc (hanya kalau diminta: berat)
-    if not Drops.list and deep and type(getgc) == "function" then
-        local ok, objects = pcall(getgc, true)
-        if ok and type(objects) == "table" then
-            for _, v in pairs(objects) do
-                if isDropList(v) then Drops.list, Drops.Source = v, "getgc"; break end
-            end
-        end
-    end
-    if Drops.list then Drops.findUpdate() end
-    return Drops.list ~= nil
-end
-
--- Cari fungsi game yang mengurangi / menghapus drop (dipakai World.dropTaken).
--- Ciri: upvalue World.dropTaken, dan fungsi itu sendiri memegang daftar drop yang sama.
-function Drops.findUpdate()
-    local w, list = Refs.World, Drops.list
-    local wd = w and rawget(w, "dropTaken")
-    if type(wd) ~= "function" or not list then return false end
-    for _, u in pairs(getUpvalues(wd)) do
-        if type(u) == "function" then
-            for _, uu in pairs(getUpvalues(u)) do
-                if rawequal(uu, list) then
-                    Drops.update = u
-                    return true
-                end
-            end
-        end
-    end
-    return false
-end
-
--- Terapkan hasil ambil drop ke tampilan, sama seperti game:
---   sisa > 0 -> angka drop dikurangi; sisa 0 -> keluar dari daftar + frame dihapus.
--- Tanpa ini, loop gambar game menampilkan drop lagi (flown di-reset saat badan tidak menyentuh).
-function Drops.applyTaken(d, left)
-    local list = Drops.list
-    if not list or Drops.key(list, d) == nil then return end
-    if not Drops.update then Drops.findUpdate() end
-    if Drops.update then
-        local ok = pcall(Drops.update, d, left)
-        if ok then
-            if left > 0 then
-                d.flown = nil
-                if typeof(d.frame) == "Instance" then pcall(function() d.frame.Visible = not d.culled end) end
-            end
-            return
-        end
-    end
-    -- cadangan manual (fungsi game tidak ketemu)
-    d.n = left
-    if left > 0 then
-        pcall(function()
-            if d.setGem then d.setGem(left) elseif d.count then d.count:set(left > 1 and tostring(left) or "") end
-        end)
-        d.flown = nil
-        if typeof(d.frame) == "Instance" then pcall(function() d.frame.Visible = not d.culled end) end
-    else
-        local i = Drops.key(list, d)
-        if type(i) == "number" and i >= 1 and i % 1 == 0 and i <= #list then table.remove(list, i)
-        elseif i ~= nil then list[i] = nil end
-        if typeof(d.frame) == "Instance" then pcall(function() d.frame:Destroy() end) end
-    end
-end
-
-local function takeDrop(d)
-    if not Drops.record(d) then return false end
-    local worldTake = Refs.World and rawget(Refs.World, "takeDrop")
-    if type(worldTake) ~= "function" and not TakeDropRemote then
-        Drops.fail("Fungsi ambil drop game belum ditemukan; tekan Hubungkan ke game")
-        return false
-    end
-    if d.taking or d.pending or d.display or (d.n or 0) <= 0 then return false end
-    -- drop yang kamu buang sendiri belum boleh dipungut lagi (aturan game), kecuali gems
-    if d.armed == false and d.id ~= 112 then return false end
-    local now = os.clock()
-    if DropFailUntil[d.uid] and now < DropFailUntil[d.uid] then return false end
-
-    local amount = d.n
-    if d.id ~= 112 and Refs.Inv then -- 112 = gems, tidak makan slot
-        local okr, room = pcall(function() return Refs.Inv:room(d.id) end)
-        if okr and type(room) == "number" then amount = math.min(amount, room) end
-    end
-    if amount <= 0 then -- inventori penuh: coba lagi 1 detik lagi
-        Drops.fail("Inventori penuh untuk " .. itemName(d.id))
-        DropFailUntil[d.uid] = now + 1
-        local last = Hook.LastFull[d.id]
-        if not last or now - last > 120 then
-            Hook.LastFull[d.id] = now
-            Hook.send("full", "Inventori penuh: " .. itemName(d.id) .. " tidak bisa diambil lagi")
-        end
-        return false
-    end
-
-    d.taking = true -- cegah diambil dobel
-    -- langsung hilang dari layar selama menunggu jawaban server.
-    -- Tidak pakai d.flown: loop gambar game me-reset flown + memunculkan drop lagi
-    -- tiap frame kalau badan tidak menyentuhnya (mode Remote = ambil dari jauh).
-    if typeof(d.frame) == "Instance" then pcall(function() d.frame.Visible = false end) end
-    local ok, taken
-    if type(worldTake) == "function" then
-        ok, taken = pcall(worldTake, d.uid, amount) -- cara game baru
-    else
-        ok, taken = pcall(TakeDropRemote.InvokeServer, TakeDropRemote, d.uid, amount)
-    end
-    d.taking = false
-
-    if not (ok and type(taken) == "number" and taken > 0 and taken <= amount) then
-        State.CollectFail = State.CollectFail + 1
-        Drops.fail(ok and "Pengambilan drop ditolak / belum dikonfirmasi server"
-            or ("Gagal ambil drop: " .. string.sub(tostring(taken), 1, 180)))
-        d.refused = os.clock() -- tanda ditolak, sama seperti game
-        d.failN = (d.failN or 0) + 1
-        DropFailUntil[d.uid] = os.clock() + math.min(8, d.failN) -- 1, 2, 3.. detik (yang terus ditolak makin jarang)
-        d.flown = nil
-        if typeof(d.frame) == "Instance" then pcall(function() d.frame.Visible = not d.culled end) end
-        return false
-    end
-    DropFailUntil[d.uid] = nil
-
-    if d.id == 112 then
-        if Refs.Gems then pcall(Refs.Gems.addGems, taken) end
-    elseif Refs.Inv then
-        pcall(function() Refs.Inv:add(d.id, taken) end)
-    end
-    Drops.applyTaken(d, math.max(0, (d.n or 0) - taken)) -- kurangi / hapus drop seperti game
-    State.Collected = State.Collected + taken
-    Stats.Items[d.id] = (Stats.Items[d.id] or 0) + taken
-    State.LastAction = "Collect " .. itemName(d.id) .. " x" .. taken
-    Drops.Status = "Terambil " .. itemName(d.id) .. " x" .. taken
-    Drops.LastError = nil
-    return true
-end
-
-local function inTile(t, x, y)
-    return x >= t.x - 0.15 and x < t.x + 1.15 and y >= t.y - 0.15 and y < t.y + 1.15
-end
-
--- ---------- Collector cepat ----------
--- Cek daftar drop TIAP FRAME. Drop di area langsung diambil, semuanya sekaligus
--- (paralel), jadi tidak antri menunggu balasan server satu per satu.
---   Auto Farm  : drop di tile yang dipilih di Grid
---   Clear / Farmer : drop di sekitar karakter
-local OffsetParse = {}
-local nextDropScan = 0
-
-local function canTry(d, now)
-    if not Drops.record(d) or d.taking or d.pending or d.display or d.n <= 0 then return false end
-    if d.armed == false and d.id ~= 112 then return false end
-    local fail = DropFailUntil[d.uid]
-    return not (fail and now < fail)
-end
-
--- Drop TIDAK diambil lewat remote oleh script: drop terambil oleh game sendiri saat badan
--- menyentuhnya (fisika game, seperti main manual). Di sini cuma cari daftar drop & hitung
--- drop yang terambil di dekat badan (untuk status).
--- Mode Remote (cara lama): drop di tile grid / di sekitar karakter diambil lewat fungsi ambil-drop game
-function Drops.remoteTick(list, s)
-    local offs = farmOffsets()
-    local farmArea = (State.AutoCollect or State.Override ~= nil) and next(offs) ~= nil
-    local nearArea = State.CollectAround or (Clear.Running and Clear.Collect) or (Farmer.Running and Farmer.Collect)
-        or Pabrik.Running or Build.Running or Splice.Roaming
-    if not farmArea and not nearArea then
-        Drops.Status = "Pilih tile Grid atau aktifkan Collect di sekitar karakter"
-        return 0
-    end
-    local cx, cy = s.x, s.y - 0.475
-    local ptx, pty = getPlayerTile()
-    local now = os.clock()
-    local R = (State.CollectRadius or 3) + 0.2
-    local z = Pabrik.Zone -- tempat drop pabrik tidak ikut diambil lagi
-    if z and z.world ~= (Refs.World and rawget(Refs.World, "name")) then z = nil end
-    local queued = 0
-    -- Snapshot mencegah drop terlewati saat request cepat menghapus elemen list.
-    for _, d in ipairs(Drops.snapshot(list)) do
-        if canTry(d, now) and not (z and math.abs(d.x - z.x) <= 2.5 and math.abs(d.y - z.y) <= 2.5) then
-            local hit = nearArea and math.abs(d.x - cx) <= R and math.abs(d.y - cy) <= R
-            if not hit and farmArea and ptx then
-                for key in pairs(offs) do
-                    local o = OffsetParse[key]
-                    if not o then
-                        local dx, dy = string.match(key, "^(-?%d+),(-?%d+)$")
-                        o = { tonumber(dx), tonumber(dy) }
-                        OffsetParse[key] = o
-                    end
-                    if o[1] and inTile({ x = ptx + o[1], y = pty + o[2] }, d.x, d.y) then
-                        hit = true
-                        break
-                    end
-                end
-            end
-            if hit then queued = queued + 1; task.spawn(takeDrop, d) end
-        end
-    end
-    if queued == 0 then Drops.Status = "Menunggu drop dalam area collect" end
-    return queued
-end
-
-local function collectTick()
-    local busy = State.AutoCollect or State.CollectAround or State.Override ~= nil or (Clear.Running and Clear.Collect)
-        or (Farmer.Running and Farmer.Collect) or Pabrik.Running or Build.Running or Splice.Roaming or Vend.Running
-    if not busy then Drops.Status = "Mati"; return end
-    local tnow = os.clock()
-    if tnow < (Drops.nextTick or 0) then return end -- 5-10x per detik cukup (hemat FPS)
-    Drops.nextTick = tnow + ((State.CollectMode == "Remote") and 0.1 or 0.2)
-    local list = Drops.list
-    if not list then
-        Drops.Status = "Daftar drop belum ditemukan; coba Hubungkan ke game saat ada drop"
-        local now = os.clock()
-        if now >= nextDropScan then -- cari daftar drop paling sering tiap 5 detik
-            nextDropScan = now + 5
-            findDropRefs()
-        end
-        return
-    end
-    local ok, s = false, nil
-    if Refs.State then ok, s = pcall(Refs.State) end
-    if not (ok and type(s) == "table" and type(s.x) == "number" and type(s.y) == "number") then
-        Drops.Status = "Posisi karakter belum terbaca"
-        return
-    end
-    if State.CollectMode == "Remote" then
-        Drops.remoteTick(list, s) -- jumlah terambil dihitung oleh takeDrop
-        return
-    end
-    Drops.Status = AutoInput.Menu and "Sentuhan: drop diambil saat badan menyentuhnya"
-        or "Kontrol gerak game belum terhubung; tekan Hubungkan ke game"
-    if State.CollectAround then Drops.Status = Drops.Status .. "; untuk radius gunakan mode Remote" end
-    local cx, cy = s.x, s.y - 0.475
-    local seen = {}
-    for _, d in ipairs(Drops.snapshot(list)) do
-        if type(d) == "table" and type(d.x) == "number" and math.abs(d.x - cx) <= 1.5 and math.abs(d.y - cy) <= 1.5 then
-            seen[d] = d.n or 0
-        end
-    end
-    for d, n in pairs(Drops.seen or {}) do
-        if seen[d] == nil and Drops.key(list, d) == nil and d.id and n > 0 then -- hilang di dekat badan = terambil
-            State.Collected = State.Collected + n
-            Stats.Items[d.id] = (Stats.Items[d.id] or 0) + n
-        end
-    end
-    Drops.seen = seen
-end
-
-table.insert(Connections, RunService.Heartbeat:Connect(function()
-    if alive() then
-        local ok, err = pcall(collectTick)
-        if not ok then Drops.fail("Error collect: " .. string.sub(tostring(err), 1, 180)) end
-    end
-end))
-
--- Tunggu sebentar sampai drop di tile ini terambil (supaya tidak tertimpa block baru)
-local function waitTileDrops(t, maxSec)
-    local list = Drops.list
-    if not list then return end
-    local t0 = os.clock()
-    while os.clock() - t0 < maxSec and alive() do
-        local now, busy = os.clock(), false
-        for _, d in ipairs(Drops.snapshot(list)) do
-            if type(d) == "table" and type(d.x) == "number" and (d.n or 0) > 0 and inTile(t, d.x, d.y)
-                and (d.taking or canTry(d, now)) then
-                busy = true
-                break
-            end
-        end
-        if not busy then return end
-        task.wait()
-    end
-end
-
--- Tunggu sampai drop yang menempel badan selesai dipungut game (sentuhan, bukan remote)
-local function waitNearDrops(maxSec)
-    local list = Drops.list
-    if not list then return end
-    task.wait(0.15) -- drop baru muncul sedikit terlambat
-    local t0 = os.clock()
-    while os.clock() - t0 < maxSec and alive() do
-        local ok, s = false, nil
-        if Refs.State then ok, s = pcall(Refs.State) end
-        if not (ok and type(s) == "table" and type(s.x) == "number") then return end
-        local cx, cy = s.x, s.y - 0.475
-        local busy = false
-        for _, d in ipairs(Drops.snapshot(list)) do
-            -- sama dengan aturan game: < 0.6 tile mendatar & setinggi badan (kaki s.y, kepala s.y - 0.95)
-            if type(d) == "table" and type(d.x) == "number" and (d.n or 0) > 0 and d.armed ~= false
-                and math.abs(d.x - s.x) < 0.6 and d.y + 0.3 > s.y - 0.95 and d.y - 0.3 < s.y then
-                local room = true
-                if d.id ~= 112 and Refs.Inv then -- inventori penuh: tidak akan terpungut
-                    local okr, r = pcall(function() return Refs.Inv:room(d.id) end)
-                    if okr and type(r) == "number" and r <= 0 then room = false end
-                end
-                if room then
-                    busy = true
-                    break
-                end
-            end
-        end
-        if not busy then return end
-        task.wait()
-    end
-end
-
----------------------------------------------------------------------
--- STATUS
----------------------------------------------------------------------
-local function offsetsText()
-    local list = {}
-    for _, o in ipairs(sortedOffsets()) do
-        table.insert(list, "(" .. o.dx .. "," .. o.dy .. ")")
-    end
-    return #list > 0 and table.concat(list, " ") or "-"
-end
-
-local lastStatusText = nil
-
-local function updateStatus()
-    if not UI.Status then return end
-    local px, py = getPlayerTile()
-    local sel = State.SelectedId
-    local txt = "Status   : " .. (State.Running and "JALAN" or "BERHENTI")
-        .. "\nBlock    : " .. (sel and (itemName(sel) .. " x" .. invCount(sel)) or "-")
-        .. "\nKarakter : " .. (px and ("(" .. px .. "," .. py .. ")") or "tidak di world")
-        .. "\nTile     : " .. offsetsText()
-        .. "\nPlace/Break/Collect : " .. State.Placed .. " / " .. State.Broken .. " / " .. State.Collected
-        .. (State.CollectFail > 0 and (" (ditolak " .. State.CollectFail .. ")") or "")
-        .. "\nCollect r3 [" .. tostring(State.CollectMode) .. "]: " .. tostring(Drops.Status or "menunggu koneksi")
-        .. "\nDaftar drop: " .. tostring(#Drops.snapshot()) .. " | sumber: " .. tostring(Drops.Source or "belum ditemukan")
-        .. (Drops.LastError and ("\nAlasan collect: " .. Drops.LastError) or "")
-        .. (State.Dropped > 0 and ("\nDrop seed: di-drop " .. State.Dropped) or "")
-        .. "\nAksi     : " .. State.LastAction
-    if txt == lastStatusText then return end
-    lastStatusText = txt
-    task.defer(function()
-        pcall(function() UI.Status:SetDesc(txt) end)
-    end)
-end
-
----------------------------------------------------------------------
--- MODE LITE (matikan particle + suara)
----------------------------------------------------------------------
-local DummyLabel = setmetatable({}, { __index = function() return 0 end, __newindex = function() end })
-local DummyParticle = setmetatable({ l = DummyLabel, k = {} }, { __index = function() return 0 end, __newindex = function() end })
-local NullSound
-NullSound = setmetatable({}, {
-    __index = function() return NullSound end,
-    __newindex = function() end,
-    __call = function() return NullSound end,
-})
-local LiteSaved = {}
-
-local function liteOverride(tbl, key, repl)
-    if type(tbl) == "table" and type(rawget(tbl, key)) == "function" then
-        table.insert(LiteSaved, { tbl, key, rawget(tbl, key) })
-        tbl[key] = repl
-    end
-end
-
-local function setLite(on)
-    State.LiteMode = on
-    if on then
-        if #LiteSaved == 0 then
-            if ParticlesOk then liteOverride(ParticlesModule, "spawn", function() return DummyParticle end) end
-            if SfxOk then
-                liteOverride(SfxModule, "play", function() return NullSound end)
-                liteOverride(SfxModule, "playAt", function() return NullSound end)
-            end
-        end
-        for _, p in ipairs(Refs.Particles) do
-            pcall(function()
-                for _, e in ipairs(p.live) do
-                    if typeof(e.l) == "Instance" then e.l.Visible = false end
-                end
-            end)
-        end
-    else
-        for _, s in ipairs(LiteSaved) do
-            pcall(function() s[1][s[2]] = s[3] end)
-        end
-        table.clear(LiteSaved)
-    end
-end
-
----------------------------------------------------------------------
--- MISC: walkspeed, infinite jump, fly + tembus block
----------------------------------------------------------------------
--- Infinite jump: game dibuat mengira ada Antigravity Generator, jadi bisa lompat di udara
-local OrigJammerOn = nil
-local function infJumpWrapper(id, ...)
-    -- dimatikan saat Clear / Farmer jalan (lompat harus normal)
-    if Misc.InfJump and id == 4992 and not AutoInput.active then
-        return true
-    end
-    if OrigJammerOn then return OrigJammerOn(id, ...) end
-    return false
-end
-
-local function hookJammer()
-    local w = Refs.World
-    if not w then return end
-    local cur = rawget(w, "jammerOn")
-    if cur == infJumpWrapper or type(cur) ~= "function" then return end
-    OrigJammerOn = cur
-    w.jammerOn = infJumpWrapper
-end
-
-local function unhookJammer()
-    local w = Refs.World
-    if w and rawget(w, "jammerOn") == infJumpWrapper and OrigJammerOn then
-        w.jammerOn = OrigJammerOn
-    end
-end
-
-local function setInfJump(on)
-    Misc.InfJump = on
-    if on then hookJammer() else unhookJammer() end
-end
-
-local function setGhost(on)
-    Misc.Ghost = on
-    if not on then
-        Misc.UpHeld, Misc.DownHeld = false, false
-        if Refs.World then Refs.World.ghost = false end
-    end
-    if UI.FlyPad then UI.FlyPad.Enabled = on end
-end
-
-local function setSpeed(pct)
-    Misc.Speed = math.clamp(math.floor(tonumber(pct) or 100), 50, 500)
-    if Misc.Speed == 100 and Refs.World then Refs.World.speedScale = 1 end
-end
-
--- Tombol gerak game dibaca dari WorldMenu.isDown. Dibungkus supaya
--- tombol ▲/▼ Fly bisa dipakai, dan Clear / Farmer bisa "menekan" tombol sendiri.
-local OrigIsDown = nil
-local function isDownWrapper(saved, key, ...)
-    if AutoInput.active then
-        if key == "keyLeft" then return AutoInput.left end
-        if key == "keyRight" then return AutoInput.right end
-        if key == "keyJump" then return AutoInput.jump end
-        if key == "keyDown" then return AutoInput.down end
-    end
-    if Misc.Ghost then
-        if key == "keyDown" and Misc.DownHeld then return true end
-        if key == "keyJump" and Misc.UpHeld then return true end
-    end
-    return OrigIsDown(saved, key, ...)
-end
-
-function AutoInput.unbindMenu()
-    local menu = AutoInput.Menu
-    if menu and OrigIsDown and rawget(menu, "isDown") == isDownWrapper then
-        pcall(function() menu.isDown = OrigIsDown end)
-    end
-    AutoInput.Menu, OrigIsDown = nil, nil
-end
-
-function AutoInput.bindMenu()
-    -- Dahulukan tabel menu yang dipakai game, bukan salinan require executor.
-    local menu = Refs.Menu
-    if type(menu) ~= "table" or type(rawget(menu, "isDown")) ~= "function" then
-        menu = MenuModOk and MenuModule or nil
-    end
-    if menu == AutoInput.Menu and menu and rawget(menu, "isDown") == isDownWrapper then return true end
-    AutoInput.unbindMenu()
-    if type(menu) ~= "table" or type(rawget(menu, "isDown")) ~= "function" then return false end
-    OrigIsDown = rawget(menu, "isDown")
-    local ok = pcall(function() menu.isDown = isDownWrapper end)
-    if not ok then OrigIsDown = nil; return false end
-    AutoInput.Menu = menu
-    return true
-end
-AutoInput.bindMenu()
-
--- Pasang walkspeed & fly tiap frame (game bisa menimpanya)
-table.insert(Connections, RunService.Heartbeat:Connect(function()
-    local w = Refs.World
-    if not w or not alive() then return end
-    if Misc.Speed ~= 100 then w.speedScale = Misc.Speed / 100 end
-    if Misc.Ghost and w.ghost ~= true then w.ghost = true end
-end))
-
----------------------------------------------------------------------
--- FARM LOOP: place semua dulu, baru break satu per satu
----------------------------------------------------------------------
-local stopFarm
-
-local function waitMs(ms)
-    task.wait(math.max(ms or 0, 10) / 1000)
-    return State.Running and alive()
-end
-
-local function validate()
-    local doPlace = farmMode() ~= "Break saja"
-    if not Refs.World then return "Data world belum ketemu. Tekan 'Hubungkan ke game'" end
-    if next(farmOffsets()) == nil then return "Pilih tile dulu di Grid Tile" end
-    if not getPlayerTile() then return "Kamu belum masuk world" end
-    if doPlace and not farmBlock() then return "Pilih block dari inventori" end
-    return nil
-end
-
--- Rayman's Fist sedang dipakai? (fungsi asli game)
-local function raymanOn()
-    local w = Refs.World
-    local f = w and rawget(w, "raymanOn")
-    if type(f) ~= "function" then return false end
-    local ok, on = pcall(f)
-    return ok and on == true
-end
-
--- Cari 2-3 tile target yang segaris dari karakter (8 arah, jarak 1-3),
--- sama seperti pukulan Rayman di game.
-local RAY_DIRS = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 }, { 1, 1 }, { 1, -1 }, { -1, 1 }, { -1, -1 } }
-local function raymanLine(px, py, active)
-    local byKey = {}
-    for _, a in ipairs(active) do byKey[a.x .. "," .. a.y] = a end
-    local best, bestDir = nil, nil
-    for _, d in ipairs(RAY_DIRS) do
-        local line = {}
-        for i = 1, 3 do
-            local a = byKey[(px + d[1] * i) .. "," .. (py + d[2] * i)]
-            if a then line[#line + 1] = a end
-        end
-        if #line >= 2 and #line > (best and #best or 0) then best, bestDir = line, d end
-    end
-    return best, bestDir
-end
-
--- Kabarkan gerakan Rayman ke server (paket yang sama dengan game saat pukulan Rayman)
-local function raymanAct(dir)
-    local ok, s = pcall(Refs.State)
-    if not ok or type(s) ~= "table" or not s.x then return end
-    if NetOk and type(Net) == "table" and Net.act then
-        pcall(Net.act.send, { kind = 4, x = s.x + dir[1], y = s.y - 0.475 + dir[2] })
-    end
-end
-
-local function farmLoop(runId)
-    local lastStatus = 0
-    while State.Running and alive() and State.RunId == runId do
-        if State.DropPause then -- sedang pergi drop seed
-            task.wait(0.2)
-            continue
-        end
-        local doPlace = farmMode() ~= "Break saja"
-        local doBreak = farmMode() ~= "Place saja"
-
-        local px, py = getPlayerTile()
-        if not px then
-            stopFarm("Karakter tidak ditemukan (keluar world?)")
-            return
-        end
-
-        local tiles = {}
-        for _, o in ipairs(sortedOffsets()) do
-            tiles[#tiles + 1] = { x = px + o.dx, y = py + o.dy }
-        end
-
-        local acted, outOfBlock = false, false
-
-        -- 0) Ambil drop di semua tile grid dengan sentuhan badan (sekali sapu), lalu balik ke posisi
-        if (State.AutoCollect or State.Override) and not State.DropPause then
-            Drops.waitSpawn(tiles) -- drop pecahan barusan datang dari server: tunggu muncul dulu
-            if State.CollectMode == "Remote" then
-                for _, t in ipairs(tiles) do waitTileDrops(t, 0.4) end -- diambil lewat remote (collectTick)
-            elseif Drops.touchAll then
-                Drops.touchAll(tiles, px, py)
-            end
-        end
-
-        -- 1) Place semua tile kosong
-        if doPlace then
-            for _, t in ipairs(tiles) do
-                if not State.Running or State.DropPause then break end
-                local r = tryPlace(t.x, t.y)
-                if r == "habis" then
-                    outOfBlock = true
-                    break
-                elseif r == "place" then
-                    acted = true
-                    if not waitMs(State.PlaceMs) then break end
-                end
-            end
-        end
-
-        -- 2) Pukul tile sampai habis (block depan lalu background).
-        --    Server hanya terima 1 pukulan tiap ~0.22 detik (tangan biasa), jadi multi target
-        --    = beberapa tile dipukul BERGANTIAN (sama seperti 2 jari). Semua tile benar-benar pecah.
-        --    Pakai Rayman's Fist: 2-3 tile segaris dipukul sekali jalan (seperti Rayman asli).
-        if doBreak then
-            local K = math.clamp(math.floor(State.MultiTarget or 1), 1, 5)
-            local nextI, active = 1, {}
-            while State.Running and alive() and not State.DropPause do
-                while #active < K and nextI <= #tiles do
-                    local t = tiles[nextI]
-                    nextI += 1
-                    active[#active + 1] = { x = t.x, y = t.y, n = 0 }
-                end
-                if #active == 0 then break end
-
-                -- pilih tile yang dipukul sekarang
-                local hits, rayDir = nil, nil
-                if K > 1 and raymanOn() then
-                    hits, rayDir = raymanLine(px, py, active)
-                end
-                if not rayDir then hits = { active[1] } end -- giliran depan antrian
-
-                local t0 = os.clock()
-                if rayDir then raymanAct(rayDir) end
-                local hit, broke = false, false
-                for i, a in ipairs(hits) do
-                    if not State.Running then break end
-                    if i > 1 then task.wait(0.05) end -- jarak antar tile seperti animasi Rayman
-                    local r = tryBreak(a.x, a.y)
-                    a.n += 1
-                    if r then hit, acted = true, true end
-                    if r == "broke" then broke = true end
-                    -- selesai kalau kosong / tidak bisa dipecah / sudah habis sampai background
-                    if r == nil or a.n > 80 or (r == "broke" and not breakableAt(a.x, a.y)) then
-                        a.done = true
-                    end
-                    a.used = true
-                end
-
-                -- tile yang barusan dipukul pindah ke belakang antrian (bergantian)
-                local nextActive = {}
-                for _, a in ipairs(active) do
-                    if not a.done and not a.used then nextActive[#nextActive + 1] = a end
-                end
-                for _, a in ipairs(hits) do
-                    a.used = nil
-                    if not a.done then nextActive[#nextActive + 1] = a end
-                end
-                active = nextActive
-
-                if hit then
-                    local gap = State.BreakMs / 1000
-                    if rayDir then gap = math.max(gap, 0.35) end -- jeda Rayman asli
-                    local rest = gap - (os.clock() - t0)
-                    if rest > 0.005 then task.wait(rest) end
-                    if not (State.Running and alive()) then break end
-                end
-                -- drop diambil otomatis oleh collector cepat
-                if broke and State.AfterBreakMs > 0 then task.wait(State.AfterBreakMs / 1000) end
-            end
-        end
-
-        if not State.Running or not alive() then break end
-        if State.DropPause then continue end
-
-        if not acted then
-            local sel = farmBlock()
-            if outOfBlock or (doPlace and sel and invCount(sel) <= 0) then
-                stopFarm("Block " .. itemName(sel) .. " di inventori habis")
-                return
-            end
-            if not waitMs(State.BreakMs) then break end
-        end
-
-        State.Cycles += 1
-        if os.clock() - lastStatus > 1 then
-            lastStatus = os.clock()
-            updateStatus()
-        end
-    end
-    updateStatus()
-end
-
-local function setRunningVisual()
-    if State.Override then return end -- dijalankan Pabrik: tombol Auto Farm tidak diubah
-    if UI.FarmToggle then pcall(function() UI.FarmToggle:Set(State.Running) end) end
-    if UI.GridStart and UI.GridMode == "farm" then
-        UI.GridStart.Text = State.Running and "STOP" or "START"
-        UI.GridStart.BackgroundColor3 = State.Running and Color3.fromRGB(200, 60, 60) or Color3.fromRGB(46, 160, 90)
-    end
-end
-
-stopFarm = function(reason)
-    State.Running = false
-    setRunningVisual()
-    if reason and not State.Quiet then
-        notify("Auto Farm berhenti", reason, 4)
-        Hook.send("stop", "Auto Farm berhenti: " .. reason)
-    end
-    updateStatus()
-end
-
--- Auto Farm, Clear & Farmer tidak boleh jalan bersamaan
-local stopClear, stopFarmer
-
-local function startFarm()
-    if State.Running then return end
-    local err = validate()
-    if err then
-        stopFarm(err)
-        return
-    end
-    if Splice.Running and Splice.stop then Splice.stop("Dihentikan karena Auto Farm dimulai") end
-    if Pabrik.Running and Pabrik.stop then Pabrik.stop("Dihentikan karena Auto Farm dimulai") end
-    if Build.Running and Build.stop then Build.stop("Dihentikan karena Auto Farm dimulai") end
-    if Clear.Running and stopClear then stopClear("Dihentikan karena Auto Farm dimulai") end
-    if Farmer.Running and stopFarmer then stopFarmer("Dihentikan karena Auto Farm dimulai") end
-    table.clear(HitCount)
-    table.clear(PlacedAt)
-    State.DropPause = false
-    State.Running = true
-    State.RunId = (State.RunId or 0) + 1
-    setRunningVisual()
-    updateStatus()
-    task.spawn(farmLoop, State.RunId)
-end
-
-
--- Fungsi untuk UI dikumpulkan di sini (Luau batasi 200 variabel per file)
-local Auto = {}
-do (function() -- fungsi sendiri: variabel di dalam tidak ikut batas 200 local
----------------------------------------------------------------------
--- GERAK OTOMATIS (dipakai Clear World & Farmer)
----------------------------------------------------------------------
--- Cara kerja:
---   - Jalan dicari pakai A* sesuai fisika game (jalan, jatuh, lompat naik 1-3 tile).
---   - Karakter digerakkan dengan "menekan" tombol, sama seperti main biasa.
---   - Tidak pakai fly / noclip karena server me-rollback.
---   - Kalau tidak ada pijakan, taruh block dari inventori (jembatan / tangga).
-local floor, abs = math.floor, math.abs
-
-local Move = { Placed = 0 }  -- jumlah block pijakan yang dipasang
-local BadEdge = {}           -- jalur yang barusan gagal (dihindari dulu)
-local ClearFail, FarmerFail = {}, {}
-local BreakTimes = {}        -- tile yang terus balik lagi setelah pecah
-local Reach = nil            -- daftar tile yang bisa dijangkau (cache)
-
-local function autoOn()
-    return (Clear.Running or Farmer.Running or Splice.Roaming or Pabrik.Running or Build.Running or Move.Homing
-        or Vend.Running) and alive()
-end
-
-local function setMoveStatus(text)
-    if Clear.Running then
-        Clear.Status = text
-    elseif Farmer.Running then
-        Farmer.Status = text
-    elseif Splice.Roaming then
-        Splice.Status = text
-    elseif Build.Running then
-        Build.Status = text
-    elseif Pabrik.Running then
-        Pabrik.Status = text
-    elseif Vend.Running then
-        Vend.Status = text
-    end
-end
-
-local function skipTile(tbl, idx, sec)
-    tbl[idx] = os.clock() + (sec or 30)
-end
-
-local function skipped(tbl, idx, now)
-    local t = tbl[idx]
-    if not t then return false end
-    if (now or os.clock()) >= t then
-        tbl[idx] = nil
-        return false
-    end
-    return true
-end
-
-local function skippedCount(tbl)
-    local n, now = 0, os.clock()
-    for _, t in pairs(tbl) do
-        if t > now then n += 1 end
-    end
-    return n
-end
-
-local function hudRange(name, def)
-    local f = Refs.Hud and Refs.Hud[name]
-    if type(f) == "function" then
-        local ok, r = pcall(f)
-        if ok and type(r) == "number" and r > 0 then return r end
-    end
-    return def
-end
-
-local function punchReach() return hudRange("punchRange", 2.5) end
-local function buildReach() return hudRange("buildRange", 2.5) end
-
-local function playerState()
-    if not Refs.State then return nil end
-    local ok, s = pcall(Refs.State)
-    if ok and type(s) == "table" and type(s.x) == "number" and type(s.y) == "number" and s.active ~= false then
-        return s
-    end
-    return nil
-end
-
-local function fgIdAt(x, y)
-    local w = Refs.World
-    local row = w and w.fg[y]
-    return (row and row[x]) or 0
-end
-
-local function fgItemAt(x, y)
-    local id = fgIdAt(x, y)
-    if id ~= 0 then return ItemDB[id] end
-    return nil
-end
-
--- Tile padat? (sama dengan cek tabrakan game)
-local function solidAt(x, y)
-    local w = Refs.World
-    if not w then return true end
-    if x < 0 or x >= w.w or y >= w.h then return true end
-    if y < 0 then return false end
-    local it = fgItemAt(x, y)
-    if not it then return false end
-    if it.combiner then
-        local ok, shut = pcall(w.combinerShut, x, y)
-        return (not ok) or (shut and true or false)
-    end
-    if it.vip then -- pintu VIP: padat kalau kamu tidak punya akses
-        local ok, may = pcall(w.vipMay, x, y)
-        return not (ok and may)
-    end
-    if it.entrance then
-        local sw = w.switches and w.switches[y * w.w + x]
-        if it.gate then
-            return not (sw and sw.off == true)
-        end
-        if sw and sw.public then return false end
-        local ok, may = pcall(function() return w.areas.mayBuild(w.lock, x, y) end)
-        return not (ok and may)
-    end
-    return it.solid and true or false
-end
-
--- Tile berbahaya (lava, duri, laser)
-local function hazardAt(x, y)
-    local it = fgItemAt(x, y)
-    return it ~= nil and (it.deadly or it.hurts or it.laser) and true or false
-end
-
-local function platformAt(x, y)
-    local it = fgItemAt(x, y)
-    return it ~= nil and it.platform and true or false
-end
-
-local function openAt(x, y)
-    return not solidAt(x, y) and not hazardAt(x, y)
-end
-
--- Ada pijakan aman di bawah tile ini?
-local function realSupport(x, y)
-    return not hazardAt(x, y + 1) and (solidAt(x, y + 1) or platformAt(x, y + 1))
-end
-
--- Target kelihatan dari badan? (tidak terhalang lantai / atap padat di antaranya)
--- Panen lewat block bisa, tapi drop-nya jatuh di balik block dan tidak terambil.
-function Move.los(nx, ny, tx, ty)
-    if ty - ny >= 2 then
-        for y = ny + 1, ty - 1 do
-            if solidAt(tx, y) then return false end
-        end
-    elseif ny - ty >= 2 then
-        for y = ty + 1, ny - 1 do
-            if solidAt(tx, y) then return false end
-        end
-    end
-    return true
-end
-
--- Tile masuk jangkauan? (bentuk kotak di sekitar badan)
-local function stateReaches(s, tx, ty, R)
-    return abs(tx + 0.5 - s.x) <= R and abs(ty + 0.5 - (s.y - 0.475)) <= R
-end
-
--- Boleh pecah di sini? (cek lock)
-local function canWorkAt(x, y)
-    local w = Refs.World
-    local ok, res = pcall(function()
-        if w.areas and type(w.areas.mayBuild) == "function" and not w.areas.mayBuild(w.lock, x, y) then
-            return false
-        end
-        if type(w.builderOk) == "function" and not w.builderOk(x, y, false) then
-            return false
-        end
-        return true
-    end)
-    return (not ok) or res
-end
-
--- ---------- Block pijakan ----------
-local function scaffoldId()
-    local id, use
-    if Clear.Running then
-        id, use = Clear.ScaffoldId, Clear.UseBlock
-    elseif Farmer.Running then
-        id, use = Farmer.ScaffoldId, Farmer.UseBlock
-    end -- Bangun Lahan tidak pakai pijakan (jalan di atas baris yang sedang dibangun)
-    if use and id and invCount(id) > 0 then return id end
-    return nil
-end
-
--- Boleh taruh block di sini? (kosong + izin bangun)
-local function placeOk(x, y)
-    local w = Refs.World
-    if not w or x < 0 or y < 0 or x >= w.w or y >= w.h then return false end
-    if fgIdAt(x, y) ~= 0 then return false end
-    local ok, res = pcall(function()
-        if w.areas and type(w.areas.canEdit) == "function" and not w.areas.canEdit(x, y) then return false end
-        if type(w.builderOk) == "function" and not w.builderOk(x, y, true) then return false end
-        return true
-    end)
-    return (not ok) or res
-end
-
-local function placeScaffold(x, y)
-    local id = scaffoldId()
-    if not id or not placeOk(x, y) then return false end
-    local s = playerState()
-    if not s or not stateReaches(s, x, y, buildReach() - 0.05) then return false end
-    sendSetTile("fg", x, y, id) -- place lewat fungsi game
-    if Refs.Inv then pcall(function() Refs.Inv:remove(id, 1) end) end
-    Move.Placed += 1
-    return true
-end
-
-local function worldVersion()
-    -- berubah tiap ada block / pohon yang berubah, supaya cache jangkauan tidak basi
-    return Clear.Broken + Farmer.Harvested + Farmer.Planted + Move.Placed + Splice.Planted
-        + Pabrik.Harvested + Pabrik.Planted + Build.Placed + Build.Harvested + Build.Planted + Build.Dug
-        + State.Placed + State.Broken
-end
-
-local function startNode(s)
-    local ny = floor(s.y - 0.475)
-    local nx = floor(s.x)
-    if realSupport(nx, ny) then return nx, ny end
-    local a, b = floor(s.x - 0.3), floor(s.x + 0.3 - 0.0001)
-    for _, c in ipairs({ a, b }) do
-        if c ~= nx and realSupport(c, ny) then return c, ny end
-    end
-    return nx, ny
-end
-
--- ---------- Antrian prioritas untuk A* ----------
-local function heapPush(hf, hi, n, f, i)
-    n += 1
-    local k = n
-    while k > 1 do
-        local p = k // 2
-        if hf[p] <= f then break end
-        hf[k], hi[k] = hf[p], hi[p]
-        k = p
-    end
-    hf[k], hi[k] = f, i
-    return n
-end
-
-local function heapPop(hf, hi, n)
-    local top = hi[1]
-    local lf, li = hf[n], hi[n]
-    hf[n], hi[n] = nil, nil
-    n -= 1
-    if n > 0 then
-        local k = 1
-        while true do
-            local c = k * 2
-            if c > n then break end
-            if c < n and hf[c + 1] < hf[c] then c += 1 end
-            if lf <= hf[c] then break end
-            hf[k], hi[k] = hf[c], hi[c]
-            k = c
-        end
-        hf[k], hi[k] = lf, li
-    end
-    return top, n
-end
-
--- ---------- A* ----------
--- Cari jalan termurah ke tempat yang bisa memukul salah satu target.
--- Langkah yang bisa dipakai:
---   walk   : geser 1 tile (+ taruh block kalau perlu)
---   fall   : jalan ke pinggir lalu jatuh
---   jump   : lompat naik 1-3 tile
---   gap    : lompati lubang 1-2 tile
---   stair  : tangga lahan: lompat naik 2 lewat lubang ke lorong setinggi 1 tile
---   pillar : lompat lalu taruh block di bawah kaki (naik 1)
-local MAX_EXPAND = 8000
-local BLOCK_COST = 2
-
-local function reachOffsets(R)
-    return floor(R), math.ceil(-R + 0.025), floor(R + 0.025)
-end
-
-local function astar(sx, sy, goals, gx, gy, R, useBlock)
-    local w = Refs.World
-    if not w then return nil, false, {} end
-    local W, H = w.w, w.h
-    local WH = W * H
-    local dxm, dyLo, dyHi = reachOffsets(R)
-    local oC, sC, bC = {}, {}, {}
-
-    local function open(x, y)
-        if x < 0 or x >= W or y >= H then return false end
-        if y < 0 then return true end
-        local i = y * W + x
-        local v = oC[i]
-        if v == nil then
-            v = openAt(x, y)
-            oC[i] = v
-        end
-        return v
-    end
-
-    local function sup(x, y)
-        if x < 0 or x >= W or y < 0 or y >= H then return false end
-        local i = y * W + x
-        local v = sC[i]
-        if v == nil then
-            v = realSupport(x, y)
-            sC[i] = v
-        end
-        return v
-    end
-
-    local function buildable(x, y)
-        if not useBlock or x < 0 or x >= W or y < 0 or y >= H then return false end
-        local i = y * W + x
-        local v = bC[i]
-        if v == nil then
-            v = placeOk(x, y)
-            bC[i] = v
-        end
-        return v
-    end
-
-    local function h(x, y)
-        local dx = abs(gx - x) - R
-        local dyRaw = gy - y
-        local dy = abs(dyRaw) - R
-        local vw = (dyRaw < 0) and 1.5 or 0.5
-        return (dx > 0 and dx or 0) + vw * (dy > 0 and dy or 0)
-    end
-
-    local function isGoal(nx, ny)
-        -- goals.maxY: tempat berdiri tidak boleh lebih bawah dari ini (Bangun Lahan)
-        if goals.maxY and ny > goals.maxY then return false end
-        for ty = ny + dyLo, ny + dyHi do
-            if ty >= 0 and ty < H then
-                local base = ty * W
-                for tx = nx - dxm, nx + dxm do
-                    -- jangan berdiri tepat di atas target (noSelf: juga jangan di dalam tile target)
-                    if tx >= 0 and tx < W and goals[base + tx] and not (tx == nx and ty == ny + 1)
-                        and not (goals.noSelf and tx == nx and ty == ny)
-                        and not (goals.los and ty - ny >= 2 and not open(tx, ny + 1))
-                        and not (goals.los and ny - ty >= 2 and not open(tx, ny - 1)) then
-                        return true
-                    end
-                end
-            end
-        end
-        return false
-    end
-
-    local ex, ey, ek, ec, eb = {}, {}, {}, {}, {}
-    local n = 0
-    local function add(x, y, kind, cost, build)
-        n += 1
-        ex[n], ey[n], ek[n], ec[n], eb[n] = x, y, kind, cost, build
-    end
-
-    local function expand(x, y)
-        n = 0
-        for s = -1, 1, 2 do
-            local ax = x + s
-            if open(ax, y) then
-                if sup(ax, y) then
-                    add(ax, y, "walk", 1, false)
-                else
-                    if buildable(ax, y + 1) then
-                        add(ax, y, "walk", 1 + BLOCK_COST, true)
-                    end
-                    -- jatuh sampai ketemu pijakan
-                    local fy = y + 1
-                    while fy < H and fy - y <= 40 and open(ax, fy) and not sup(ax, fy) do
-                        fy += 1
-                    end
-                    if fy < H and open(ax, fy) and sup(ax, fy) then
-                        add(ax, fy, "fall", 1 + 0.5 * (fy - y), false)
-                    end
-                    -- lompati lubang 1-2 tile
-                    if open(x, y - 1) and open(x, y - 2) then
-                        for dist = 2, 3 do
-                            local mx = x + (dist - 1) * s
-                            if not (open(mx, y) and open(mx, y - 1) and open(mx, y - 2)) then break end
-                            if dist == 3 and sup(mx, y) then break end
-                            local bx = x + dist * s
-                            if open(bx, y - 1) and open(bx, y - 2) then
-                                for k = 0, 2 do
-                                    if not open(bx, y + k) then break end
-                                    if sup(bx, y + k) then
-                                        add(bx, y + k, "gap", dist + 0.5 + 0.5 * k, false)
-                                        break
-                                    end
-                                end
-                            end
-                        end
-                    end
-                end
-            end
-            -- lompat naik (atas kepala harus kosong)
-            for dy = 1, 3 do
-                if not open(x, y - dy) then break end
-                if open(x, y - dy - 1) and open(ax, y - dy) and sup(ax, y - dy) and open(ax, y - dy - 1) then
-                    add(ax, y - dy, "jump", 1 + 1.5 * dy, false)
-                end
-            end
-            -- tangga lahan: naik 1-2 tile ke lorong setinggi 1 tile (atapnya pas di atas kepala,
-            -- jadi lompat biasa tidak muat). Rapat ke dinding, lompat, geser masuk di puncak.
-            for dy = 1, 2 do
-                if open(x, y - 1) and (dy == 1 or open(x, y - 2)) and open(ax, y - dy) and sup(ax, y - dy)
-                    and not (open(x, y - dy - 1) and open(ax, y - dy - 1)) then
-                    add(ax, y - dy, "stair", 3 + 1.5 * dy, false)
-                end
-            end
-        end
-        -- naik 1 pakai block
-        if useBlock and open(x, y - 1) and open(x, y - 2) and open(x, y - 3) and buildable(x, y) then
-            add(x, y - 1, "pillar", 2 + BLOCK_COST, true)
-        end
-        return n
-    end
-
-    local startI = sy * W + sx
-    local g, came, kind, buildOf, closed = { [startI] = 0 }, {}, {}, {}, {}
-    local hf, hi, hn = {}, {}, 0
-    hn = heapPush(hf, hi, hn, h(sx, sy), startI)
-    local expanded = 0
-    local now = os.clock()
-
-    while hn > 0 do
-        local cur
-        cur, hn = heapPop(hf, hi, hn)
-        if not closed[cur] then
-            closed[cur] = true
-            local cx, cy = cur % W, cur // W
-            if isGoal(cx, cy) then
-                local path = {}
-                local i = cur
-                while i ~= startI do
-                    local p = came[i]
-                    table.insert(path, 1, {
-                        fx = p % W, fy = p // W, x = i % W, y = i // W,
-                        kind = kind[i], build = buildOf[i], key = p * WH + i,
-                    })
-                    i = p
-                end
-                return path, false, closed
-            end
-            expanded += 1
-            if expanded > MAX_EXPAND then return nil, false, closed end
-            if expanded % 400 == 0 then
-                task.wait()
-                if not autoOn() then return nil, false, closed end
-            end
-            local gc = g[cur]
-            local cnt = expand(cx, cy)
-            for k = 1, cnt do
-                local ni = ey[k] * W + ex[k]
-                if not closed[ni] then
-                    local bad = BadEdge[cur * WH + ni]
-                    if not (bad and bad > now) then
-                        local ng = gc + ec[k]
-                        local old = g[ni]
-                        if old == nil or ng < old then
-                            g[ni], came[ni], kind[ni], buildOf[ni] = ng, cur, ek[k], eb[k]
-                            hn = heapPush(hf, hi, hn, ng + h(ex[k], ey[k]), ni)
-                        end
-                    end
-                end
-            end
-        end
-    end
-    return nil, true, closed -- tidak ada jalan sama sekali
-end
-
--- Semua tile yang bisa dijangkau dari area ini
-local function reachableTileSet(closed, W, R)
-    local set = {}
-    local dxm, dyLo, dyHi = reachOffsets(R)
-    local n = 0
-    for i in pairs(closed) do
-        local x, y = i % W, i // W
-        for dy = dyLo, dyHi do
-            local ty = y + dy
-            if ty >= 0 then
-                local base = ty * W
-                for dx = -dxm, dxm do
-                    local tx = x + dx
-                    if tx >= 0 and tx < W then set[base + tx] = true end
-                end
-            end
-        end
-        n += 1
-        if n % 500 == 0 then task.wait() end
-    end
-    return set
-end
-
--- Simpan daftar tile terjangkau, supaya tile di seberang jurang langsung dilewati
--- (tidak cari jalan berulang yang bikin karakter diam).
-local function reachFilter(startI, R, useBlock)
-    local c = Reach
-    if c and c.world == Refs.World and c.start == startI and c.R == R and c.block == useBlock
-        and c.ver == worldVersion() and os.clock() - c.at < 30 then
-        return c.set
-    end
-    return nil
-end
-
-local function storeReach(startI, R, useBlock, closed)
-    Reach = {
-        world = Refs.World, start = startI, R = R, block = useBlock, ver = worldVersion(), at = os.clock(),
-        set = reachableTileSet(closed, Refs.World.w, R),
-    }
-end
-
--- ---------- Gerakkan karakter ----------
-local function releaseInput()
-    AutoInput.left, AutoInput.right, AutoInput.jump, AutoInput.down = false, false, false, false
-end
-
-local function frame()
-    task.wait()
-    return autoOn()
-end
-
-local function waitAuto(ms)
-    task.wait(math.max(ms or 0, 30) / 1000)
-    return autoOn()
-end
-
--- ===== ANIMASI AKSI (hanya tampilan di layar sendiri, tidak mengirim apa pun ke server) =====
--- Tangan karakter mengarah ke tile (sama seperti saat pemain memukul / memasang sendiri).
-function Anim.swing(x, y, kind)
-    if not (Anim.fn and Anim.idx and Anim.set) then return end
-    local s = playerState()
-    local facing = (s and x + 0.5 < s.x) and -1 or 1
-    pcall(Anim.set, Anim.fn, Anim.idx, { t = os.clock(), x = x + 0.5, y = y + 0.5, facing = facing, kind = kind })
-end
-
--- Efek asap kecil saat block dipasang (pakai efek "place" game)
-function Anim.puff(x, y)
-    local list = Refs.Particles
-    if not list or #list == 0 then return end
-    local pick = Anim.Particles
-    if not pick then
-        local worldGui = PlayerGui:FindFirstChild("GameGui")
-        worldGui = worldGui and worldGui:FindFirstChild("World")
-        for _, p in ipairs(list) do
-            local ok, inWorld = pcall(function()
-                return worldGui ~= nil and typeof(p.parent) == "Instance" and p.parent:IsDescendantOf(worldGui)
-            end)
-            if ok and inWorld then
-                pick = p
-                break
-            end
-        end
-        pick = pick or list[1]
-        Anim.Particles = pick
-    end
-    pcall(function() pick:place(x + 0.5, y + 0.5) end)
-end
-
-function Anim.place(x, y, id)
-    local it = ItemDB[id]
-    local seed = it and it.kind == "seed"
-    Anim.swing(x, y, "build")
-    if not seed then Anim.puff(x, y) end
-end
-
--- Jalan ke targetX, lepas tombol saat sudah cukup dekat untuk berhenti
-local function steerX(s, targetX, tol)
-    local dx = targetX - s.x
-    local vx = s.vx or 0
-    local decel = s.grounded and 48 or 17
-    local dir = 0
-    if abs(dx) > tol then
-        dir = dx > 0 and 1 or -1
-        if vx * dir > 0 and (vx * vx) / (2 * decel) >= abs(dx) - tol * 0.5 then
-            dir = 0
-        end
-    end
-    AutoInput.left = dir < 0
-    AutoInput.right = dir > 0
-end
-
--- Jalan sampai berdiri di tengah tile tujuan
-local function execWalk(tx, ty)
-    local cx = tx + 0.5
-    local s0 = playerState()
-    if not s0 then return false end
-    local limit = 1.5 + abs(cx - s0.x) * 0.35
-    local t0 = os.clock()
-    while frame() do
-        local s = playerState()
-        if not s or s.dead then return false end
-        local nx, ny = floor(s.x), floor(s.y - 0.475)
-        if s.grounded and ny ~= ty then return false end
-        steerX(s, cx, 0.1)
-        if nx == tx and abs(s.x - cx) <= 0.2 and s.grounded and abs(s.vx or 0) < 2 then
-            AutoInput.left, AutoInput.right = false, false
-            return true
-        end
-        if os.clock() - t0 > limit then return false end
-    end
-    return false
-end
-
--- Jalan ke pinggir lalu jatuh ke tile tujuan
-local function execFall(e)
-    local cx = e.x + 0.5
-    local limit = 1.5 + 0.3 * (e.y - e.fy)
-    local t0 = os.clock()
-    while frame() do
-        local s = playerState()
-        if not s or s.dead then return false end
-        steerX(s, cx, 0.1)
-        if s.grounded then
-            local nx, ny = floor(s.x), floor(s.y - 0.475)
-            if ny == e.y then
-                if nx == e.x and abs(s.x - cx) <= 0.25 then return true end
-            elseif ny ~= e.fy then
-                return false
-            end
-        end
-        if os.clock() - t0 > limit then return false end
-    end
-    return false
-end
-
--- Lompat naik ke tile sebelah
-local function execJump(e)
-    if not execWalk(e.fx, e.fy) then return false end
-    local dy = e.fy - e.y
-    local top = e.y + 1                               -- tinggi kaki di tujuan
-    local releaseY = top - ((dy == 1) and 0 or 0.4)   -- lepas lompat di sini (kepala tidak kebentur)
-    local cx = e.x + 0.5
-    releaseInput()
-    if not frame() then return false end              -- lepas 1 frame supaya lompat terbaca
-    AutoInput.jump = true
-    local t0 = os.clock()
-    local airborne = false
-    while frame() do
-        local s = playerState()
-        if not s or s.dead then return false end
-        if not s.grounded then airborne = true end
-        if AutoInput.jump and (s.y <= releaseY or (airborne and (s.vy or 0) >= 0)) then
-            AutoInput.jump = false
-        end
-        if s.y <= top + 0.25 then
-            steerX(s, cx, 0.1)
-        else
-            steerX(s, e.fx + 0.5, 0.15)
-        end
-        if airborne and s.grounded then
-            local nx, ny = floor(s.x), floor(s.y - 0.475)
-            if ny == e.y then
-                if nx == e.x and abs(s.x - cx) <= 0.25 then
-                    AutoInput.jump = false
-                    return true
-                end
-            else
-                return false
-            end
-        end
-        if not airborne and os.clock() - t0 > 0.35 then return false end
-        if os.clock() - t0 > 1.8 then return false end
-    end
-    return false
-end
-
--- Lompati lubang: ancang-ancang, lompat di ujung, rem di udara
-local function execGap(e)
-    if not execWalk(e.fx, e.fy) then return false end
-    local s0 = playerState()
-    if not s0 then return false end
-    local dir = (e.x > e.fx) and 1 or -1
-    local takeoff = e.fx + 0.5 + dir * 0.6
-    local startY = s0.y
-    local cx = e.x + 0.5
-    releaseInput()
-    local t0 = os.clock()
-    local jumped, airborne, jumpAt = false, false, 0
-    while frame() do
-        local s = playerState()
-        if not s or s.dead then return false end
-        if not jumped then
-            AutoInput.left, AutoInput.right = dir < 0, dir > 0
-            if (s.x - takeoff) * dir >= 0 or not s.grounded then
-                jumped, jumpAt = true, os.clock()
-                AutoInput.jump = s.grounded
-            end
-        else
-            if not s.grounded then airborne = true end
-            if AutoInput.jump and (s.y <= startY - 1 or (airborne and (s.vy or 0) >= 0)) then
-                AutoInput.jump = false
-            end
-            steerX(s, cx, 0.1)
-            if airborne and s.grounded then
-                local nx, ny = floor(s.x), floor(s.y - 0.475)
-                if ny == e.y then
-                    if nx == e.x and abs(s.x - cx) <= 0.25 then return true end
-                else
-                    return false
-                end
-            end
-            if not airborne and os.clock() - jumpAt > 0.35 then return false end
-        end
-        if os.clock() - t0 > 2.2 then return false end
-    end
-    return false
-end
-
--- Tangga lahan: naik 1-2 tile ke lorong setinggi 1 tile (lewat lubang tangga / keluar dari lubang).
--- Cara main manual: berdiri rapat ke sisi tujuan, lompat, tekan arah tujuan SETELAH badan naik
--- (kalau ditekan terlalu cepat badan masuk ke bawah block tujuan -> kepala kebentur -> jatuh),
--- saat kepala menempel atap lorong kaki sudah di atas block tujuan -> geser masuk. 3 cara dicoba.
-function Move.execStair(e)
-    if not execWalk(e.fx, e.fy) then return false end
-    local dir = (e.x > e.fx) and 1 or -1
-    local top = e.y + 1 -- tinggi kaki di tujuan (atas block pijakan)
-    local hug = e.fx + 0.5 + dir * 0.17
-    for try = 1, 3 do
-        -- rapat ke dinding sisi tujuan
-        local t0 = os.clock()
-        while frame() do
-            local s = playerState()
-            if not s or s.dead then return false end
-            steerX(s, hug, 0.03)
-            if abs(s.x - hug) <= 0.06 and abs(s.vx or 0) < 1 then break end
-            if os.clock() - t0 > 0.8 then break end
-        end
-        releaseInput()
-        if not frame() then return false end
-        local s0 = playerState()
-        if not s0 then return false end
-        local y0 = s0.y
-        AutoInput.jump = true
-        t0 = os.clock()
-        local airborne, landed = false, nil
-        while frame() do
-            local s = playerState()
-            if not s or s.dead then return false end
-            if not s.grounded then airborne = true end
-            if AutoInput.jump and (s.y <= top - 0.1 or (airborne and (s.vy or 0) >= 0)) then
-                AutoInput.jump = false -- sudah setinggi tujuan / kena atap
-            end
-            -- Saat lompat di bawah atap lorong, kepala menempel di atap +-0.18 dtk dan kaki sudah di atas block
-            -- tujuan: tekan arah di saat itu -> badan langsung masuk lorong (tidak perlu diangkat game).
-            -- Tombol arah JANGAN ditekan di lantai: badan masuk ke bawah block tujuan -> kepala kebentur -> jatuh.
-            -- coba 1: saat kaki sudah setinggi atas block tujuan (menempel atap)
-            -- coba 2: setelah naik 0.15 tile (menempel sisi block, game mengangkat badan s/d 0.3 tile)
-            -- coba 3: saat kaki 0.25 tile di bawah atas block
-            local press = (try == 1 and s.y <= top + 0.02) or (try == 2 and s.y <= y0 - 0.15) or (try == 3 and s.y <= top + 0.25)
-            if airborne and press then
-                AutoInput.right, AutoInput.left = dir > 0, dir < 0
-            else
-                steerX(s, hug, 0.03)
-            end
-            if airborne and s.grounded then
-                landed = floor(s.y - 0.475)
-                break
-            end
-            if not airborne and os.clock() - t0 > 0.35 then break end
-            if os.clock() - t0 > 1.8 then break end
-        end
-        releaseInput()
-        if landed == e.y then
-            return execWalk(e.x, e.y) -- sudah di lorong atas: ke tengah tile tujuan
-        end
-        if landed ~= nil and landed ~= e.fy then return false end -- jatuh ke tempat lain
-        if not execWalk(e.fx, e.fy) then return false end
-    end
-    return false
-end
-
--- Naik 1 tile: lompat, taruh block di bawah kaki, lalu mendarat di atasnya.
--- Block ditaruh agak telat supaya posisi di server sudah ikut naik.
-local function execPillar(e)
-    if not execWalk(e.fx, e.fy) then return false end
-    if fgIdAt(e.fx, e.fy) ~= 0 then return false end
-    releaseInput()
-    if not frame() then return false end
-    AutoInput.jump = true
-    local t0 = os.clock()
-    local placed, airborne = false, false
-    while frame() do
-        local s = playerState()
-        if not s or s.dead then return false end
-        if not s.grounded then airborne = true end
-        steerX(s, e.fx + 0.5, 0.12)
-        if AutoInput.jump and (s.y < e.fy - 0.9 or (airborne and (s.vy or 0) >= 0)) then
-            AutoInput.jump = false
-        end
-        if not placed and airborne and s.y < e.fy - 0.25 and ((s.vy or 0) > -6 or s.y < e.fy - 0.8) then
-            placed = placeScaffold(e.fx, e.fy)
-            if not placed then return false end
-        end
-        if s.grounded and airborne then
-            local nx, ny = floor(s.x), floor(s.y - 0.475)
-            return placed and nx == e.x and ny == e.y
-        end
-        if not airborne and os.clock() - t0 > 0.35 then return false end
-        if os.clock() - t0 > 1.8 then return false end
-    end
-    return false
-end
-
-local function followPath(path)
-    local i = 1
-    while i <= #path do
-        if not autoOn() then return false end
-        local e = path[i]
-        local last, ok = i, false
-        if e.kind == "walk" then
-            -- langkah searah digabung jadi satu gerakan
-            local dir = e.x - e.fx
-            while path[last + 1] and path[last + 1].kind == "walk" and (path[last + 1].x - path[last + 1].fx) == dir do
-                last += 1
-            end
-            local anyBuild = false
-            for j = i, last do
-                if path[j].build then
-                    anyBuild = true
-                    break
-                end
-            end
-            if anyBuild then
-                -- perlu block: taruh block di depan, lalu melangkah
-                ok = true
-                for j = i, last do
-                    local st = path[j]
-                    if st.build and not realSupport(st.x, st.y) then
-                        setMoveStatus(("Taruh block pijakan (%d,%d)"):format(st.x, st.y + 1))
-                        if not placeScaffold(st.x, st.y + 1) or not waitAuto(120) then
-                            ok = false
-                            break
-                        end
-                    end
-                    if not execWalk(st.x, st.y) then
-                        ok = false
-                        break
-                    end
-                end
-            else
-                setMoveStatus(("Jalan ke (%d,%d)"):format(path[last].x, path[last].y))
-                ok = execWalk(path[last].x, path[last].y)
-            end
-        elseif e.kind == "pillar" then
-            setMoveStatus(("Naik pakai block ke (%d,%d)"):format(e.x, e.y))
-            ok = execPillar(e)
-        elseif e.kind == "fall" then
-            setMoveStatus(("Turun ke (%d,%d)"):format(e.x, e.y))
-            ok = execFall(e)
-        elseif e.kind == "jump" then
-            setMoveStatus(("Lompat ke (%d,%d)"):format(e.x, e.y))
-            ok = execJump(e)
-        elseif e.kind == "gap" then
-            setMoveStatus(("Lompati lubang ke (%d,%d)"):format(e.x, e.y))
-            ok = execGap(e)
-        elseif e.kind == "stair" then
-            setMoveStatus(("Naik tangga ke (%d,%d)"):format(e.x, e.y))
-            ok = Move.execStair(e)
-        end
-        releaseInput()
-        if not ok then
-            -- hindari jalur ini sementara (tangga cuma sebentar, supaya tidak memutar jauh ke tangga lain)
-            BadEdge[e.key] = os.clock() + ((e.kind == "stair") and 5 or 20)
-            return false
-        end
-        i = last + 1
-    end
-    return true
-end
-
--- Cari jalan ke grup target, lalu jalan ke sana
-local function travelGroup(sx, sy, group, R, useBlock, skipTbl, failTbl)
-    local w = Refs.World
-    local goals = {}
-    goals.maxY = group.maxY
-    goals.los = group.los
-    for _, t in ipairs(group) do goals[t.idx] = true end
-    local first = group[1]
-    setMoveStatus(("Cari jalan A* ke (%d,%d)"):format(first.x, first.y))
-    local path, exhausted, closed = astar(sx, sy, goals, first.x, first.y, R, useBlock)
-    if path then
-        if #path == 0 then
-            for _, t in ipairs(group) do skipTile(skipTbl, t.idx, 20) end
-        elseif not followPath(path) then
-            failTbl[first.idx] = (failTbl[first.idx] or 0) + 1
-            if failTbl[first.idx] >= 3 then
-                for _, t in ipairs(group) do skipTile(skipTbl, t.idx, 40) end
-            end
-        end
-        releaseInput()
-        return true
-    end
-    -- tidak ada jalan ke grup ini
-    for _, t in ipairs(group) do skipTile(skipTbl, t.idx, exhausted and 60 or 30) end
-    if exhausted and w then storeReach(sy * w.w + sx, R, useBlock, closed) end
-    releaseInput()
-    return false
-end
-
--- ---------- Datangi drop yang belum terambil ----------
--- Hasil panen kadang jatuh di luar jangkauan collect. Drop dicari dari daftar drop game
--- (sama seperti Growscan), lalu karakter jalan mendekat (A*, tanpa pijakan) sampai drop
--- itu benar-benar terambil. Drop yang tidak ada jalannya dilewati sebentar.
--- Ambil drop di tile kerja dengan sentuhan badan (Auto Farm, Pabrik, bibit Bangun Lahan), tanpa remote.
--- Aturan game: drop terpungut kalau jaraknya < 0.6 tile dari tengah badan (mendatar) dan setinggi badan.
---   - tile sebaris (kiri / kanan, sampai 3 tile): disusuri sampai tile terjauh tiap sisi
---   - tile baris atas (kiri, tengah, kanan): berdiri di bawahnya lalu lompat kecil (tap); selama di udara
---     geser ke tile atas berikutnya yang masih ada drop-nya (bisa kena 2 sekaligus)
--- lalu balik lagi ke posisi kerja (hx, hy). Hasil: true = sudah balik ke posisi kerja.
-function Drops.touchAll(tiles, hx, hy)
-    local list = Drops.list
-    if not list or not OrigIsDown then return false end
-    local function dropsAt(t)
-        for _, d in ipairs(Drops.snapshot(list)) do
-            if canTry(d, os.clock())
-                and not d.taking and inTile(t, d.x, d.y) then
-                return true
-            end
-        end
-        return false
-    end
-    local has = {}
-    for _, t in ipairs(tiles) do
-        if not solidAt(t.x, t.y) and dropsAt(t) then has[#has + 1] = t end
-    end
-    if #has == 0 then return false end
-    local s0 = playerState()
-    if not s0 or s0.dead or not s0.grounded then return false end
-    local function ground(c) return openAt(c, hy) and realSupport(c, hy) end
-    local function walkable(a, b)
-        local st = (b >= a) and 1 or -1
-        for c = a, b, st do
-            if not ground(c) then return false end
-        end
-        return true
-    end
-    local was = AutoInput.active
-    AutoInput.active = true
-    local function moveTo(cx, maxT)
-        local t0 = os.clock()
-        while alive() and os.clock() - t0 < (maxT or 1.2) do
-            task.wait()
-            local c = playerState()
-            if not c or c.dead then break end
-            steerX(c, cx, 0.1)
-            if c.grounded and abs(c.x - cx) <= 0.15 and abs(c.vx or 0) < 1.5 then
-                AutoInput.left, AutoInput.right = false, false
-                return true
-            end
-        end
-        AutoInput.left, AutoInput.right = false, false
-        return false
-    end
-    -- lompat kecil (tap = naik +-1.4 tile, tidak sampai naik ke atas baris block), di udara geser ke toX
-    local function hop(toX)
-        AutoInput.left, AutoInput.right = false, false
-        local c0 = playerState()
-        if not c0 then return end
-        local y0 = c0.y
-        AutoInput.jump = true
-        local t0, air = os.clock(), false
-        while alive() and os.clock() - t0 < 1.4 do
-            task.wait()
-            local c = playerState()
-            if not c or c.dead then break end
-            if not c.grounded then
-                air = true
-                AutoInput.jump = false -- tap: lepas begitu lepas dari tanah
-            end
-            if toX and air and c.y <= y0 - 0.25 then steerX(c, toX, 0.1) else AutoInput.left, AutoInput.right = false, false end
-            if air and c.grounded then break end
-            if not air and os.clock() - t0 > 0.35 then break end
-        end
-        AutoInput.jump, AutoInput.left, AutoInput.right = false, false, false
-    end
-    -- baris badan: susuri sampai tile terjauh tiap sisi
-    local lo, hi = hx, hx
-    for _, t in ipairs(has) do
-        if t.y == hy and abs(t.x - hx) <= 3 then
-            if t.x < lo then lo = t.x end
-            if t.x > hi then hi = t.x end
-        end
-    end
-    if lo < hx and walkable(hx - 1, lo) then moveTo(lo + 0.5) end
-    if hi > hx and walkable(hx + 1, hi) then moveTo(hi + 0.5) end
-    -- baris atas: lompat di bawah tile yang masih ada drop-nya (maks 4 lompatan)
-    for _ = 1, 4 do
-        local cs = playerState()
-        if not cs or not alive() then break end
-        local cur = floor(cs.x)
-        local cols = {}
-        for _, t in ipairs(has) do
-            if t.y == hy - 1 and abs(t.x - hx) <= 1 and ground(t.x) and walkable(cur, t.x)
-                and not solidAt(t.x, t.y) and dropsAt(t) then
-                cols[#cols + 1] = t.x
-            end
-        end
-        if #cols == 0 then break end
-        table.sort(cols, function(p, q) return abs(p - cur) < abs(q - cur) end)
-        local a = cols[1]
-        if a ~= cur then moveTo(a + 0.5) end
-        hop(cols[2] and (cols[2] + 0.5) or nil) -- sambil geser ke tile berikutnya
-    end
-    -- balik ke posisi kerja
-    local ok = moveTo(hx + 0.5, 2)
-    AutoInput.left, AutoInput.right, AutoInput.jump = false, false, false
-    AutoInput.active = was
-    waitNearDrops(0.2)
-    return ok
-end
-
-function Drops.touch(t, hx, hy)
-    return Drops.touchAll({ t }, hx, hy)
-end
-
--- Tile yang barusan pecah: drop-nya datang dari server (sesuai ping). Tunggu sampai drop baru
--- muncul di tile itu (atau batas waktu), supaya tidak keburu ketimpa block baru / tidak tersentuh.
-function Drops.waitSpawn(tiles)
-    local ping = 0.1
-    pcall(function() ping = LocalPlayer:GetNetworkPing() end)
-    local limit = math.clamp(0.15 + 2.5 * ping, 0.25, 0.8)
-    local newest = nil
-    for _, t in ipairs(tiles) do
-        local b = Drops.brokeAt[t.x .. "," .. t.y]
-        if b and os.clock() - b < limit and (not newest or b > newest) then newest = b end
-    end
-    if not newest then return end
-    local list = Drops.list
-    while os.clock() - newest < limit and alive() do
-        if list then
-            for _, d in ipairs(list) do
-                if type(d) == "table" and type(d.x) == "number" and (d.born or 0) >= newest then
-                    for _, t in ipairs(tiles) do
-                        if inTile(t, d.x, d.y) then
-                            task.wait(0.05) -- drop lain dari pecahan yang sama
-                            return
-                        end
-                    end
-                end
-            end
-        end
-        task.wait()
-    end
-end
-
--- Datangi 1 drop sampai terambil (berdiri di tile drop-nya; kalau tile itu tidak bisa dipijak,
--- misal lubang tangga: berdiri tepat di bawahnya lalu lompat sekali). Hasil: true = terambil.
-function Move.visitDrop(d)
-    local w = Refs.World
-    local s = playerState()
-    if not w or not s then return false, "nopath" end
-    local W = w.w
-    local tx, ty = floor(d.x), floor(d.y)
-    if solidAt(tx, ty) then return false, "nopath" end -- terkubur di dalam block: tidak bisa disentuh
-    local sx, sy = startNode(s)
-    local goal = { [ty * W + tx] = true }
-    local path = astar(sx, sy, goal, tx, ty, 0.5, false)
-    if not path and ty + 1 < w.h then
-        path = astar(sx, sy, { [(ty + 1) * W + tx] = true }, tx, ty + 1, 0.5, false)
-    end
-    if not path then path = astar(sx, sy, goal, tx, ty, 1.2, false) end
-    if not path then return false, "nopath" end
-    if #path > 0 then
-        local ok = followPath(path)
-        releaseInput()
-        if not ok then return false, "nopath" end
-    end
-    local ping = 0.1
-    pcall(function() ping = LocalPlayer:GetNetworkPing() end)
-    waitNearDrops(math.clamp(0.6 + 3 * ping, 1, 2.5))
-    local function left() return (d.n or 0) > 0 and Drops.key(Drops.list, d) ~= nil end
-    local cur = playerState()
-    if left() and cur and cur.grounded and abs(d.x - cur.x) <= 0.9 and d.y < cur.y - 0.9 and d.y > cur.y - 2.6 then
-        -- drop di atas kepala: lompat sekali supaya kena badan
-        AutoInput.active = true
-        AutoInput.jump = true
-        task.wait(0.25)
-        AutoInput.jump = false
-        local t0 = os.clock()
-        repeat
-            task.wait(0.05)
-            local c = playerState()
-        until not c or c.grounded or os.clock() - t0 > 1.5
-        waitNearDrops(0.5)
-    end
-    if left() then return false, "left" end
-    return true
-end
-
--- Susuri 1 baris (tile badan ry) dari kolom xa ke xb tanpa berhenti di tiap drop:
--- drop di jalan terambil sambil lewat, sama seperti main manual.
-function Move.walkRow(ry, xa, xb)
-    local w = Refs.World
-    if not w then return false end
-    for _, tx in ipairs({ xa, xb }) do
-        local s = playerState()
-        if not s or s.dead then return false end
-        local sx, sy = startNode(s)
-        if not (sx == tx and sy == ry) then
-            local goal = { [ry * w.w + tx] = true }
-            local path = astar(sx, sy, goal, tx, ry, 0.5, false) or astar(sx, sy, goal, tx, ry, 1.2, false)
-            if not path then
-                releaseInput()
-                return false
-            end
-            if #path > 0 and not followPath(path) then
-                releaseInput()
-                return false
-            end
-        end
-    end
-    releaseInput()
-    return true
-end
-
--- Ambil drop yang belum terambil, PER BARIS (seperti main manual):
---   pilih drop terdekat (baris sendiri didahulukan), lalu susuri baris itu dari ujung terdekat
---   ke ujung lainnya tanpa berhenti. Yang masih tertinggal (mis. di lubang tangga) baru didatangi
---   satu-satu, dan yang tetap tidak terambil tidak dicoba lagi sebentar.
--- filter(d) = true: drop ini boleh diambil (nil = semua). maxSec = batas waktu (20 dtk).
-Move.FetchFail = {}
-function Move.fetchDrops(live, maxDist, filter, maxSec)
-    local list = Drops.list
-    local w = Refs.World
-    if not list or not w then return 0 end
-    maxDist = maxDist or 8
-    local got, t0 = 0, os.clock()
-    local function want(d, now)
-        if not (canTry(d, now) and d.id) then return false end
-        if Move.FetchFail[d.uid] and now < Move.FetchFail[d.uid] then return false end
-        if solidAt(floor(d.x), floor(d.y)) then -- terkubur di dalam block: tidak bisa disentuh
-            Move.FetchFail[d.uid] = now + 300
-            return false
-        end
-        local z = Pabrik.Zone
-        if z and not Move.NoZone and z.world == rawget(w, "name") and abs(d.x - z.x) <= 2.5 and abs(d.y - z.y) <= 2.5 then
-            return false
-        end
-        if filter and not filter(d) then return false end
-        if d.id ~= 112 and Refs.Inv then -- inventori penuh: tidak usah diambil
-            local okr, r = pcall(function() return Refs.Inv:room(d.id) end)
-            if okr and type(r) == "number" and r <= 0 then return false end
-        end
-        return true
-    end
-    while live() and alive() and os.clock() - t0 < (maxSec or 20) do
-        local s = playerState()
-        if not s or s.dead then break end
-        if not s.grounded then
-            task.wait(0.05)
-            continue
-        end
-        local cx, cy = s.x, s.y - 0.475
-        local now = os.clock()
-        local best, bd = nil, nil
-        for _, d in ipairs(Drops.snapshot(list)) do
-            if want(d, now) then
-                local dx, dy = d.x - cx, d.y - cy
-                if abs(dx) <= maxDist and abs(dy) <= maxDist and (abs(dx) >= 0.6 or abs(dy) >= 0.75) then
-                    local dd = dx * dx + 9 * dy * dy -- baris sendiri didahulukan
-                    if not bd or dd < bd then best, bd = d, dd end
-                end
-            end
-        end
-        if not best then break end
-        local ry = floor(best.y)
-        if best.x < 0 or ry < 0 or best.x >= w.w or ry >= w.h then
-            Move.FetchFail[best.uid] = now + 30
-        else
-            -- semua drop di baris itu: susuri dari ujung terdekat ke ujung lainnya
-            local inRow, lo, hi = {}, best.x, best.x
-            for _, d in ipairs(Drops.snapshot(list)) do
-                if floor(d.y) == ry and abs(d.x - cx) <= maxDist and want(d, now) then
-                    inRow[#inRow + 1] = d
-                    if d.x < lo then lo = d.x end
-                    if d.x > hi then hi = d.x end
-                end
-            end
-            local xa, xb = floor(lo), floor(hi)
-            if abs(hi - cx) < abs(lo - cx) then xa, xb = xb, xa end
-            setMoveStatus(("Ambil drop baris y %d (x %d-%d)"):format(ry, math.min(xa, xb), math.max(xa, xb)))
-            local ok = Move.walkRow(ry, xa, xb)
-            -- pungutan dikirim ke server: tunggu balasannya (ping) sebelum menilai drop tertinggal
-            local ping = 0.1
-            pcall(function() ping = LocalPlayer:GetNetworkPing() end)
-            local tw = os.clock()
-            repeat
-                task.wait(0.05)
-                local busy = false
-                for _, d in ipairs(inRow) do
-                    if d.taking then
-                        busy = true
-                        break
-                    end
-                end
-            until not busy or os.clock() - tw > math.clamp(0.3 + 3 * ping, 0.5, 2.5)
-            got += 1
-            Move.FetchTry = Move.FetchTry or {}
-            for _, d in ipairs(inRow) do
-                if (d.n or 0) > 0 and Drops.key(list, d) ~= nil then
-                    local okv, why = false, "nopath"
-                    if ok then okv, why = Move.visitDrop(d) end
-                    if not okv then
-                        local tries = (Move.FetchTry[d.uid] or 0) + 1
-                        Move.FetchTry[d.uid] = tries
-                        if why == "left" and tries < 4 then
-                            Move.FetchFail[d.uid] = os.clock() + 1.5 -- sudah didatangi (balasan server telat / sisa sebagian): coba lagi sebentar lagi
-                        else
-                            Move.FetchFail[d.uid] = os.clock() + 30 -- tidak ada jalan / tetap tidak terambil
-                        end
-                    else
-                        Move.FetchTry[d.uid] = nil
-                    end
-                end
-            end
-        end
-    end
-    releaseInput()
-    return got
-end
-
-local function autoBegin()
-    AutoInput.active = true
-    releaseInput()
-    Reach = nil
-    if Misc.Ghost then
-        setGhost(false) -- fly dimatikan (kena rollback)
-        if UI.GhostToggle then pcall(function() UI.GhostToggle:Set(false) end) end
-    end
-end
-
-local function autoEnd()
-    if Clear.Running or Farmer.Running or Splice.Roaming or Pabrik.Running or Build.Running or Move.Homing
-        or Vend.Running then
-        return
-    end
-    AutoInput.active = false
-    releaseInput()
-end
-
-local function blockText(useBlock, id)
-    if not useBlock then return "mati" end
-    if not id then return "belum dipilih" end
-    local n = invCount(id)
-    return itemName(id) .. " x" .. n .. (n <= 0 and " (habis)" or "")
-end
-
----------------------------------------------------------------------
--- CLEAR WORLD: bersihkan dari baris atas ke bawah, 2 baris sekali sapu
----------------------------------------------------------------------
--- Boleh dipecah? (lock, vending, display tidak disentuh)
-local function clearCanBreak(id)
-    if not id or id == 0 then return false end
-    local it = ItemDB[id]
-    if not it then return false end
-    if it.lock or it.area or it.guildLock or it.vend or it.display then return false end
-    local h = (it.kind == "seed") and 20 or it.hits
-    if type(h) == "number" and h > 0 then return true end
-    local w = Refs.World
-    return (it.staffHits and w and w.areas and w.areas.staff) and true or false
-end
-
--- Layer yang dipecah: fg dulu, lalu bg
-local function clearLayerAt(x, y)
-    local w = Refs.World
-    local sp = w and w.spawn
-    if sp ~= nil and (typeof(sp) == "Vector2" or type(sp) == "table") and x == sp.X and y == sp.Y then
-        return nil
-    end
-    local fg = tileAt("fg", x, y)
-    if fg == nil then return nil end
-    if fg ~= 0 then
-        if clearCanBreak(fg) then return "fg", fg end
-        return nil -- fg tidak bisa dipecah, bg juga tidak
-    end
-    if Clear.IncludeBg then
-        local bg = tileAt("bg", x, y)
-        if bg and bg ~= 0 and clearCanBreak(bg) then return "bg", bg end
-    end
-    return nil
-end
-
--- Cari baris paling atas yang masih ada block
-local function scanTopRow()
-    local w = Refs.World
-    local W, H = w.w, w.h
-    local now = os.clock()
-    for y = 0, H - 1 do
-        local frow, brow = w.fg[y], w.bg[y]
-        for x = 0, W - 1 do
-            local fid = frow and frow[x] or 0
-            local bid = brow and brow[x] or 0
-            if (fid ~= 0 or (Clear.IncludeBg and bid ~= 0)) and clearLayerAt(x, y)
-                and not skipped(Clear.Skip, y * W + x, now) then
-                return y
-            end
-        end
-    end
-    return nil
-end
-
-local function countRemaining()
-    local w = Refs.World
-    if not w then return -1 end
-    local W, H = w.w, w.h
-    local n, scanned = 0, 0
-    for y = 0, H - 1 do
-        local frow, brow = w.fg[y], w.bg[y]
-        for x = 0, W - 1 do
-            local fid = frow and frow[x] or 0
-            local bid = brow and brow[x] or 0
-            if (fid ~= 0 or (Clear.IncludeBg and bid ~= 0)) and clearLayerAt(x, y) then n += 1 end
-        end
-        scanned += W
-        if scanned >= 8000 then
-            scanned = 0
-            task.wait()
-        end
-    end
-    return n
-end
-
--- Arah sapu. Zig-zag: arah dipilih sekali per baris (dari ujung terdekat),
--- lalu dipegang sampai baris selesai supaya tidak bolak-balik.
-local function bandDir(topRow, s)
-    if Clear.Sweep ~= "Zig-zag" then return 1 end
-    if Clear.DirRow == topRow and Clear.Dir then return Clear.Dir end
-    local w = Refs.World
-    local now = os.clock()
-    local minX, maxX
-    for y = topRow, math.min(topRow + 1, w.h - 1) do
-        for x = 0, w.w - 1 do
-            if clearLayerAt(x, y) and not skipped(Clear.Skip, y * w.w + x, now) then
-                if not minX or x < minX then minX = x end
-                if not maxX or x > maxX then maxX = x end
-            end
-        end
-    end
-    local dir = 1
-    if minX and maxX and abs(s.x - maxX) < abs(s.x - minX) then dir = -1 end
-    Clear.DirRow, Clear.Dir = topRow, dir
-    return dir
-end
-
--- Semua target di baris ini, urut sesuai arah sapu.
--- Tile yang tidak terjangkau langsung dilewati.
-local function bandTargets(top, bottom, dir, filter)
-    local w = Refs.World
-    local W = w.w
-    local list = {}
-    local now = os.clock()
-    for y = top, math.min(bottom, w.h - 1) do
-        for x = 0, W - 1 do
-            local idx = y * W + x
-            if clearLayerAt(x, y) and not skipped(Clear.Skip, idx, now) then
-                if filter and not filter[idx] then
-                    skipTile(Clear.Skip, idx, 60) -- di seberang jurang / tidak ada jalan
-                elseif canWorkAt(x, y) then
-                    list[#list + 1] = { x = x, y = y, idx = idx }
-                else
-                    skipTile(Clear.Skip, idx, 300) -- tidak ada izin
-                end
-            end
-        end
-    end
-    table.sort(list, function(a, b)
-        if a.x ~= b.x then return a.x * dir < b.x * dir end
-        return a.y < b.y
-    end)
-    return list
-end
-
--- Tile yang bisa dipukul dari sini. Pijakan kaki dipecah paling akhir.
-local function clearInReach(s, bottom, dir)
-    local w = Refs.World
-    local W = w.w
-    local R = punchReach() - 0.08
-    local cx, cy = s.x, s.y - 0.475
-    local footRow = floor(s.y + 0.01)
-    local colA, colB = floor(s.x - 0.3), floor(s.x + 0.3 - 0.0001)
-    local now = os.clock()
-    local list = {}
-    for ty = math.max(0, floor(cy - R - 0.5)), math.min(floor(cy + R + 0.5), bottom, w.h - 1) do
-        for tx = math.max(0, floor(cx - R - 0.5)), math.min(floor(cx + R + 0.5), W - 1) do
-            if stateReaches(s, tx, ty, R) then
-                local idx = ty * W + tx
-                if not skipped(Clear.Skip, idx, now) and clearLayerAt(tx, ty) then
-                    if canWorkAt(tx, ty) then
-                        list[#list + 1] = {
-                            x = tx, y = ty, idx = idx,
-                            support = (ty == footRow and tx >= colA and tx <= colB),
-                        }
-                    else
-                        skipTile(Clear.Skip, idx, 300)
-                    end
-                end
-            end
-        end
-    end
-    table.sort(list, function(a, b)
-        if a.support ~= b.support then return not a.support end
-        if a.x ~= b.x then return a.x * dir < b.x * dir end
-        return a.y < b.y
-    end)
-    return list
-end
-
--- Kalau pijakan dipecah, jatuh berapa tile? (nil = jatuh ke lava/duri)
-local function fallAfterBreak(s, x, footRow)
-    local colA, colB = floor(s.x - 0.3), floor(s.x + 0.3 - 0.0001)
-    for c = colA, colB do
-        if c ~= x and (solidAt(c, footRow) or platformAt(c, footRow)) then return 0 end -- masih menapak kolom lain
-    end
-    local w = Refs.World
-    for y = footRow + 1, math.min(w.h - 1, footRow + 60) do
-        if hazardAt(x, y) then return nil end
-        if solidAt(x, y) or platformAt(x, y) then return y - footRow end
-    end
-    return 60
-end
-
--- Pukul satu tile sampai bersih (fg lalu bg)
-local function clearBreakTile(t)
-    local x, y, idx = t.x, t.y, t.idx
-    local layer, id = clearLayerAt(x, y)
-    if not layer then return end
-    local hits, maxHits = 0, hitsNeeded(id) * 3 + 6
-    while Clear.Running and alive() do
-        layer, id = clearLayerAt(x, y)
-        if not layer then return end
-        local r = tryBreak(x, y, Clear.IncludeBg)
-        if r == nil then
-            skipTile(Clear.Skip, idx, 60)
-            return
-        end
-        if r == "broke" then
-            Clear.Broken += 1
-            Clear.Status = "Pecah " .. itemName(id) .. " (" .. x .. "," .. y .. ")"
-            BreakTimes[idx] = (BreakTimes[idx] or 0) + 1
-            if BreakTimes[idx] > 6 then -- server terus mengembalikan tile ini
-                skipTile(Clear.Skip, idx, 120)
-                return
-            end
-            hits = 0
-            local _, nid = clearLayerAt(x, y)
-            if nid then maxHits = hitsNeeded(nid) * 3 + 6 end
-        else
-            hits += 1
-            Clear.Status = "Pukul " .. itemName(id) .. " (" .. x .. "," .. y .. ")"
-            if hits > maxHits then
-                skipTile(Clear.Skip, idx, 45)
-                return
-            end
-        end
-        if not waitAuto(State.BreakMs) then return end
-        if r == "broke" then
-            local s = playerState()
-            if not s or not s.grounded then return end -- jatuh, cek ulang posisi
-        end
-    end
-end
-
-local function clearBreakList(list, s0)
-    local footY = floor(s0.y - 0.475)
-    local R = punchReach() - 0.08
-    local done = 0
-    for _, t in ipairs(list) do
-        if not Clear.Running or not alive() then break end
-        local s = playerState()
-        if not s or s.dead or not stateReaches(s, t.x, t.y, R) then break end
-        if not s.grounded or floor(s.y - 0.475) ~= footY then break end
-        local skipIt = false
-        if t.support then
-            local d = fallAfterBreak(s, t.x, floor(s.y + 0.01))
-            if d == nil then
-                skipIt = true
-                Clear.Status = ("Lewati (%d,%d): di bawahnya berbahaya"):format(t.x, t.y)
-            elseif d > 3 then
-                -- di bawahnya jurang: pecah nanti dari samping
-                skipIt = true
-                Clear.Status = ("Lewati pijakan (%d,%d): di bawahnya jurang"):format(t.x, t.y)
-            end
-        end
-        if skipIt then
-            skipTile(Clear.Skip, t.idx, 20)
-        else
-            clearBreakTile(t)
-            done += 1
-        end
-    end
-    return done
-end
-
-local lastClearText = nil
-local function updateClearStatus()
-    if not UI.ClearStatus then return end
-    local txt = "Status   : " .. (Clear.Running and "JALAN" or "BERHENTI")
-        .. "\nBaris    : " .. (Clear.TopRow >= 0 and (Clear.TopRow .. "-" .. (Clear.TopRow + 1)) or "-")
-        .. "  | arah: " .. ((Clear.Dir == -1 and Clear.Sweep == "Zig-zag") and "kanan→kiri" or "kiri→kanan")
-        .. "\nDipecah  : " .. Clear.Broken .. "  | collect: " .. State.Collected
-        .. "\nSisa     : " .. (Clear.Remaining >= 0 and tostring(Clear.Remaining) or "-")
-        .. "  | dilewati: " .. skippedCount(Clear.Skip)
-        .. "\nPijakan  : " .. blockText(Clear.UseBlock, Clear.ScaffoldId) .. "  | dipasang: " .. Move.Placed
-        .. "\nAksi     : " .. Clear.Status
-    if txt == lastClearText then return end
-    lastClearText = txt
-    task.defer(function()
-        pcall(function() UI.ClearStatus:SetDesc(txt) end)
-    end)
-end
-
-local function clearLoop()
-    local idle, lastUi, lastCount = 0, 0, -10
-    while Clear.Running and alive() do
-        task.wait()
-        local now = os.clock()
-        if now - lastCount > 3 then
-            lastCount = now
-            Clear.Remaining = countRemaining()
-            if not Clear.Running or not alive() then break end
-        end
-        if now - lastUi > 0.5 then
-            lastUi = now
-            updateClearStatus()
-        end
-        local w = Refs.World
-        local s = playerState()
-        if not w or not s or s.dead then
-            releaseInput()
-            Clear.Status = "Menunggu karakter / world..."
-            task.wait(0.5)
-            continue
-        end
-        if not s.grounded then
-            releaseInput() -- masih di udara, tunggu mendarat
-            continue
-        end
-        releaseInput()
-
-        local topRow = scanTopRow()
-        if not topRow then
-            local remaining = countRemaining()
-            Clear.Remaining = remaining
-            if remaining == 0 then
-                stopClear("World sudah bersih!")
-                return
-            end
-            idle += 1
-            if idle >= 3 then
-                stopClear(("Selesai. Sisa %d tile tidak bisa dijangkau / dipecah"):format(remaining))
-                return
-            end
-            Clear.Status = ("Sisa %d tile dilewati, coba ulang (%d/3)..."):format(remaining, idle)
-            updateClearStatus()
-            table.clear(Clear.Skip)
-            table.clear(ClearFail)
-            table.clear(BadEdge)
-            Reach = nil
-            if not waitAuto(2000) then break end
-            continue
-        end
-
-        Clear.TopRow = topRow
-        local bottom = topRow + 1 -- 2 baris dibersihkan dulu sebelum turun
-        local dir = bandDir(topRow, s)
-
-        -- 1) Pecahkan yang terjangkau
-        local list = clearInReach(s, bottom, dir)
-        if #list > 0 then
-            if clearBreakList(list, s) > 0 then idle = 0 end
-            continue
-        end
-
-        -- 2) Ambil drop di sekitar dengan menyusurinya (sentuhan badan), lalu jalan ke bagian berikutnya
-        if Clear.Collect then
-            local band0 = topRow - 1
-            if Move.fetchDrops(function() return Clear.Running end, 5, function(d)
-                return d.y >= band0 and d.y < bottom + 2
-            end, 8) > 0 then
-                continue
-            end
-        end
-        local R = punchReach() - 0.35
-        local useBlock = scaffoldId() ~= nil
-        local sx, sy = startNode(s)
-        local band = bandTargets(topRow, bottom, dir, reachFilter(sy * w.w + sx, R, useBlock))
-        if #band > 0 then
-            -- tujuan: 5 kolom berikutnya sesuai arah sapu
-            local group = {}
-            for _, t in ipairs(band) do
-                if (t.x - band[1].x) * dir <= 4 then group[#group + 1] = t end
-            end
-            travelGroup(sx, sy, group, R, useBlock, Clear.Skip, ClearFail)
-        end
-    end
-    releaseInput()
-end
-
-local function setClearVisual()
-    if UI.ClearToggle then pcall(function() UI.ClearToggle:Set(Clear.Running) end) end
-end
-
-stopClear = function(reason)
-    Clear.Running = false
-    autoEnd()
-    setClearVisual()
-    Clear.Status = reason or "Dihentikan"
-    if reason then
-        notify("Auto Clear", reason, 5)
-        if not string.find(reason, "^Dihentikan") then Hook.send("stop", "Auto Clear berhenti: " .. reason) end
-    end
-    updateClearStatus()
-end
-
-local function checkAutoStart()
-    if not Refs.World then return "Data world belum ketemu. Tekan 'Hubungkan ke game'" end
-    if not Refs.Punch then return "Fungsi pukul game belum ketemu. Tekan 'Hubungkan ke game'" end
-    if not OrigIsDown then return "Kontrol gerak game (WorldMenu.isDown) tidak ketemu" end
-    if not playerState() then return "Kamu belum masuk world" end
-    return nil
-end
-
-local function startClear()
-    if Clear.Running then return end
-    local err = checkAutoStart()
-    if err then
-        notify("Auto Clear", err, 4)
-        setClearVisual()
-        return
-    end
-    if Clear.UseBlock and (not Clear.ScaffoldId or invCount(Clear.ScaffoldId) <= 0) then
-        notify("Auto Clear", "Block pijakan belum dipilih / habis: jalan tanpa block pijakan", 5)
-    end
-    if Splice.Running and Splice.stop then Splice.stop("Dihentikan karena Auto Clear dimulai") end
-    if Pabrik.Running and Pabrik.stop then Pabrik.stop("Dihentikan karena Auto Clear dimulai") end
-    if Build.Running and Build.stop then Build.stop("Dihentikan karena Auto Clear dimulai") end
-    if State.Running then stopFarm("Dihentikan karena Auto Clear dimulai") end
-    if Farmer.Running then stopFarmer("Dihentikan karena Auto Clear dimulai") end
-    table.clear(Clear.Skip)
-    table.clear(ClearFail)
-    table.clear(BadEdge)
-    table.clear(BreakTimes)
-    Clear.Broken = 0
-    Clear.Remaining = -1
-    Clear.TopRow = -1
-    Clear.DirRow, Clear.Dir = nil, nil
-    Clear.Status = "Mulai..."
-    Clear.Running = true
-    autoBegin()
-    setClearVisual()
-    updateClearStatus()
-    task.spawn(function()
-        local ok, e = pcall(clearLoop)
-        if not ok then
-            warn("[Zekio supreme] Auto Clear error: " .. tostring(e))
-            if Clear.Running then stopClear("Error: " .. tostring(e)) end
-        end
-    end)
-end
-
----------------------------------------------------------------------
--- FARMER: panen pohon yang siap + tanam seed
----------------------------------------------------------------------
--- Pohon siap kalau: waktu server >= waktu tanam + lama tumbuh (sama dengan game).
--- Seed ditanam di tile kosong yang di bawahnya ada block.
-local function findTreeRefs()
-    Refs.Trees, Refs.TreeMode, Refs.TreeP = nil, nil, nil
-    -- 1) cara utama (game v1159+): ikuti fungsi World.tileChanged -> fungsi simpan pohon.
-    --    Tetap jalan walau world belum punya pohon (tabel kosong).
-    local okS, foundS = pcall(function() return Auto.findTreesStruct and Auto.findTreesStruct() end)
-    if okS and foundS == true then return true end
-    Refs.Trees, Refs.TreeMode, Refs.TreeP = nil, nil, nil
-    -- 2) game lama: handler remote WorldRemotes.TreeChanged
-    local ev = WorldRemotes:FindFirstChild("TreeChanged")
-    if ev and ev:IsA("RemoteEvent") and getconnections then
-        local ok, conns = pcall(getconnections, ev.OnClientEvent)
-        if ok and type(conns) == "table" then
-            for _, c in ipairs(conns) do
-                local okf, fn = pcall(function() return c.Function end)
-                if okf and type(fn) == "function" then
-                    for _, u in pairs(getUpvalues(fn)) do
-                        if type(u) == "table" and u ~= Refs.World and rawget(u, "fg") == nil then
-                            local _, v = next(u)
-                            if type(v) == "table" and type(rawget(v, "p")) == "number" then
-                                Refs.Trees, Refs.TreeMode, Refs.TreeP = u, "idx", "p"
-                                break
-                            end
-                        end
-                    end
-                end
-                if Refs.Trees then return true end
-            end
-        end
-    end
-    -- 3) cadangan: telusuri upvalue lebih dalam (butuh world yang sudah ada pohonnya)
-    if Auto.findTreesDeep then pcall(Auto.findTreesDeep) end
-    return Refs.Trees ~= nil
-end
-
--- Tabel ini cocok jadi data pohon? Kosong = boleh (world tanpa pohon).
--- Isi = [y*W+x] -> { p = waktu tanam (waktu server), f = buah, s = sudah di-splice }
-function Auto.treeTableOk(t)
-    local w = Refs.World
-    if type(t) ~= "table" or t == w or getmetatable(t) ~= nil or rawget(t, "fg") ~= nil then return false end
-    local n = 0
-    for k, v in pairs(t) do
-        n += 1
-        if n > 6 then break end
-        if type(k) ~= "number" or type(v) ~= "table" or type(rawget(v, "p")) ~= "number" then return false end
-        if w and type(w.w) == "number" and type(w.h) == "number" and (k < 0 or k >= w.w * w.h) then return false end
-    end
-    return true
-end
-
--- Cari data pohon dari struktur kode game (tanpa getgc, tanpa remote):
---   World.tileChanged memegang (upvalue) tabel pohon + fungsi simpan pohon.
---   Fungsi simpan pohon memegang World + tabel pohon + tabel gambar pohon.
---   Tabel yang dipegang KEDUANYA = tabel pohon.
-function Auto.findTreesStruct()
-    local w = Refs.World
-    if not w or not getUpvalues then return false end
-    local roots = {}
-    for _, name in ipairs({ "tileChanged", "treeChanged", "setTree" }) do
-        local f = rawget(w, name)
-        if type(f) == "function" then roots[#roots + 1] = f end
-    end
-    for _, root in ipairs(roots) do
-        local ups = getUpvalues(root)
-        local tset = {}
-        for _, u in pairs(ups) do
-            if type(u) == "table" and u ~= w then tset[u] = true end
-        end
-        for _, g in pairs(ups) do
-            if type(g) == "function" then
-                local gu = getUpvalues(g)
-                local hasW, nT, shared = false, 0, {}
-                for _, v in pairs(gu) do
-                    if rawequal(v, w) then
-                        hasW = true
-                    elseif type(v) == "table" then
-                        nT += 1
-                        if tset[v] then shared[#shared + 1] = v end
-                    end
-                end
-                -- fungsi simpan pohon: upvalue sedikit (World + 2 tabel), satu tabel sama dengan tileChanged
-                if hasW and nT <= 3 and #shared == 1 and Auto.treeTableOk(shared[1]) then
-                    Refs.Trees, Refs.TreeMode, Refs.TreeP = shared[1], "idx", "p"
-                    return true
-                end
-            end
-        end
-        -- cadangan: tabel milik tileChanged yang isinya jelas data pohon
-        for t in pairs(tset) do
-            if next(t) ~= nil and Auto.treeTableOk(t) and Auto.treeShape(t) == "idx" then
-                Refs.Trees, Refs.TreeMode, Refs.TreeP = t, "idx", "p"
-                return true
-            end
-        end
-    end
-    return false
-end
-
--- Data pohon di tile (x,y): { p = waktu tanam (waktu server), s = sudah di-splice }.
--- Bentuk tabel bisa beda tergantung versi game (lihat Auto.findTreesDeep).
-function Auto.treeEntry(x, y)
-    local t, w = Refs.Trees, Refs.World
-    if not t or not w then return nil end
-    local mode = Refs.TreeMode or "idx"
-    local e
-    if mode == "xy" then
-        e = t[x .. "," .. y]
-    elseif mode == "rows" then
-        local r = t[y]
-        e = type(r) == "table" and r[x] or nil
-    else
-        e = t[y * w.w + x]
-    end
-    if type(e) == "number" then return { p = e } end
-    if type(e) ~= "table" then return nil end
-    local pk = Refs.TreeP or "p"
-    if pk ~= "p" then return { p = rawget(e, pk), s = rawget(e, "s") } end
-    return e
-end
-
--- Tabel ini data pohon? Hasil: mode ("idx" / "xy" / "rows"), nama field waktu tanam
-function Auto.treeShape(t)
-    local w = Refs.World
-    if type(t) ~= "table" or not w or t == w or rawget(t, "fg") ~= nil then return nil end
-    local W, H = w.w, w.h
-    local okT, st = pcall(function() return workspace:GetServerTimeNow() end)
-    if not okT then st = os.time() end
-    local function timeKey(e)
-        if type(e) == "number" then
-            return (math.abs(e - st) < 86400 * 90) and "#" or nil
-        end
-        if type(e) ~= "table" then return nil end
-        local pv = rawget(e, "p")
-        if type(pv) == "number" and math.abs(pv - st) < 86400 * 90 then return "p" end
-        for fk, fv in pairs(e) do
-            if type(fv) == "number" and math.abs(fv - st) < 86400 * 90 then return fk end
-        end
-        return nil
-    end
-    local function seedAt(x, y)
-        local row = w.fg[y]
-        local id = row and row[x]
-        local it = id and ItemDB[id]
-        return it ~= nil and it.kind == "seed"
-    end
-    local checked, good, bad, mode, pk = 0, 0, 0, nil, nil
-    for k, v in pairs(t) do
-        checked += 1
-        if checked > 10 then break end
-        local x, y, e, m = nil, nil, nil, nil
-        if type(k) == "number" and k % 1 == 0 and k >= 0 then
-            if type(v) == "table" and k < H and timeKey(v) == nil then
-                -- baris: t[y][x]
-                local kx, ve = next(v)
-                if type(kx) == "number" and kx >= 0 and kx < W then x, y, e, m = kx, k, ve, "rows" end
-            elseif k < W * H then
-                x, y, e, m = k % W, k // W, v, "idx"
-            end
-        elseif type(k) == "string" then
-            local a, b = string.match(k, "^(%d+),(%d+)$")
-            if a then x, y, e, m = tonumber(a), tonumber(b), v, "xy" end
-        end
-        if not x then return nil end
-        if mode and mode ~= m then return nil end
-        mode = m
-        local tk = timeKey(e)
-        if tk and seedAt(x, y) then
-            good += 1
-            pk = (tk == "#") and "p" or tk
-        else
-            bad += 1 -- data lama (pohon sudah dipanen) masih tersimpan: boleh sedikit
-        end
-    end
-    if good == 0 or bad > good then return nil end
-    return mode, pk
-end
-
--- Cari data pohon lewat upvalue fungsi game (remote world, fungsi World, RunService, Net). Tanpa getgc.
-function Auto.findTreesDeep()
-    local w = Refs.World
-    if not w or not getUpvalues then return false end
-    local queue, seenF, seenT, nF = {}, {}, {}, 0
-    local function addFn(fn)
-        if type(fn) == "function" and not seenF[fn] then queue[#queue + 1] = fn end
-    end
-    local function tryTable(t)
-        if seenT[t] then return false end
-        seenT[t] = true
-        local mode, pk = Auto.treeShape(t)
-        if mode then
-            Refs.Trees, Refs.TreeMode, Refs.TreeP = t, mode, pk
-            return true
-        end
-        return false
-    end
-    -- 1) isi World langsung (tabel & fungsi)
-    for _, v in pairs(w) do
-        if type(v) == "table" then
-            if tryTable(v) then return true end
-        elseif type(v) == "function" then
-            addFn(v)
-        end
-    end
-    -- 2) handler remote world
-    if getconnections then
-        for _, ev in ipairs(WorldRemotes:GetChildren()) do
-            if ev:IsA("RemoteEvent") then
-                local ok, conns = pcall(getconnections, ev.OnClientEvent)
-                if ok and type(conns) == "table" then
-                    for _, c in ipairs(conns) do
-                        local okf, fn = pcall(function() return c.Function end)
-                        if okf then addFn(fn) end
-                    end
-                end
-            end
-        end
-        for _, name in ipairs({ "RenderStepped", "Heartbeat", "Stepped" }) do
-            local okS, sig = pcall(function() return RunService[name] end)
-            local ok, conns = pcall(getconnections, sig)
-            if okS and ok and type(conns) == "table" then
-                for _, c in ipairs(conns) do
-                    local okf, fn = pcall(function() return c.Function end)
-                    if okf then addFn(fn) end
-                end
-            end
-        end
-    end
-    -- 3) telusuri upvalue (maks 1500 fungsi)
-    local i = 1
-    while i <= #queue and nF < 1500 do
-        local fn = queue[i]
-        i += 1
-        if not seenF[fn] then
-            seenF[fn] = true
-            nF += 1
-            for _, u in pairs(getUpvalues(fn)) do
-                if type(u) == "table" then
-                    if tryTable(u) then return true end
-                elseif type(u) == "function" then
-                    addFn(u)
-                end
-            end
-        end
-    end
-    return false
-end
-
-local function farmReach()
-    return math.min(punchReach(), buildReach())
-end
-
-local function seedCount()
-    return Farmer.SeedId and invCount(Farmer.SeedId) or 0
-end
-
--- Kapan pohon ini siap panen (nil = bukan pohon)
-local function treeReadyAt(x, y, id)
-    if not Refs.Trees or not Refs.World then return nil end
-    local it = ItemDB[id]
-    if not (it and it.kind == "seed") then return nil end
-    local t = Auto.treeEntry(x, y)
-    if type(t) ~= "table" or type(t.p) ~= "number" then return nil end
-    return t.p + (it.grow or 0)
-end
-
--- Bisa tanam seed di sini? (seedId kosong = seed Farmer)
-local function plantSpotOk(x, y, seedId)
-    local w = Refs.World
-    if not w or x < 0 or y < 0 or x >= w.w or y + 1 >= w.h then return false end
-    if fgIdAt(x, y) ~= 0 then return false end
-    local below = fgIdAt(x, y + 1)
-    if below == 0 then return false end
-    local it = ItemDB[below]
-    if not it or it.kind == "seed" then return false end
-    if not (solidAt(x, y + 1) or it.platform) then return false end
-    local ok, res = pcall(function()
-        if w.areas and type(w.areas.canEdit) == "function" and not w.areas.canEdit(x, y) then return false end
-        if type(w.builderOk) == "function" and not w.builderOk(x, y, true) then return false end
-        local sid = seedId or Farmer.SeedId
-        local seed = sid and ItemDB[sid]
-        if seed and type(w.needsWay) == "function" and w.needsWay(seed)
-            and type(w.wayBlocked) == "function" and w.wayBlocked(x, y) then
-            return false
-        end
-        return true
-    end)
-    return (not ok) or res
-end
-
--- Mesin panen & tanam dipakai bersama oleh Farmer dan Pabrik.
--- FC = pengaturan yang sedang dipakai (seed, area, kecepatan, dll).
-local FC = nil
-local function farmerCfg()
-    return {
-        run = function() return Farmer.Running end,
-        harvest = Farmer.Harvest,
-        plant = Farmer.Plant,
-        seed = Farmer.SeedId,
-        skip = Farmer.Skip,
-        hms = Farmer.HarvestMs,
-        pms = Farmer.PlantMs,
-        area = nil,      -- function(x, y): boleh panen di sini?
-        plantSet = nil,  -- [idx] = true: hanya tanam di tile ini
-        exclude = nil,   -- [idx] = true: jangan tanam di tile ini
-        row = Farmer.Row,        -- tanam rapi per baris
-        collect = Farmer.Collect, -- ambil drop panen dulu sebelum lanjut
-        status = function(t) Farmer.Status = t end,
-        onHarvest = function(id)
-            Farmer.Harvested += 1
-            if id then Farmer.Got[id] = true end
-        end,
-        onPlant = function() Farmer.Planted += 1 end,
-    }
-end
-
-local function fcSeeds()
-    return FC.seed and invCount(FC.seed) or 0
-end
-
-local function fcHarvestOk(x, y)
-    return FC.harvest and (not FC.area or FC.area(x, y))
-end
-
-local function fcPlantOk(idx)
-    return (not FC.plantSet or FC.plantSet[idx]) and not (FC.exclude and FC.exclude[idx])
-end
-
-local function plantSeed(x, y)
-    local id = FC.seed
-    if not id or invCount(id) <= 0 then return false end
-    sendSetTile("fg", x, y, id)
-    if Refs.Inv then pcall(function() Refs.Inv:remove(id, 1) end) end
-    FC.onPlant()
-    FC.status("Tanam " .. itemName(id) .. " (" .. x .. "," .. y .. ")")
-    return true
-end
-
--- Panen & tanam semua yang terjangkau dari sini
-local function farmerWorkInReach(s)
-    local w = Refs.World
-    local W = w.w
-    local R = farmReach() - 0.08
-    local cx, cy = s.x, s.y - 0.475
-    local now = os.clock()
-    local st = workspace:GetServerTimeNow()
-    local doPlant = FC.plant and fcSeeds() > 0
-    local harvest, plant = {}, {}
-    local bx, by = floor(s.x), floor(cy)
-    for ty = math.max(0, floor(cy - R - 0.5)), math.min(floor(cy + R + 0.5), w.h - 1) do
-        for tx = math.max(0, floor(cx - R - 0.5)), math.min(floor(cx + R + 0.5), W - 1) do
-            if stateReaches(s, tx, ty, R) then
-                local idx = ty * W + tx
-                if not skipped(FC.skip, idx, now) then
-                    local id = fgIdAt(tx, ty)
-                    if id ~= 0 and fcHarvestOk(tx, ty) and (not FC.only or id == FC.only) then
-                        local ra = treeReadyAt(tx, ty, id)
-                        if ra and st >= ra and Move.los(bx, by, tx, ty) then
-                            if canWorkAt(tx, ty) then
-                                harvest[#harvest + 1] = { x = tx, y = ty, idx = idx }
-                            else
-                                skipTile(FC.skip, idx, 120)
-                            end
-                        end
-                    elseif doPlant and id == 0 and fcPlantOk(idx) and (not FC.row or FC.row.y == ty)
-                        and plantSpotOk(tx, ty, FC.seed) then
-                        plant[#plant + 1] = { x = tx, y = ty, idx = idx }
-                    end
-                end
-            end
-        end
-    end
-    local function byX(a, b)
-        if a.x ~= b.x then return a.x < b.x end
-        return a.y < b.y
-    end
-    table.sort(harvest, byX)
-    table.sort(plant, byX)
-
-    local done, got = 0, 0
-    for _, t in ipairs(harvest) do
-        if not FC.run() or not alive() then return done end
-        local cur = playerState()
-        if not cur or not stateReaches(cur, t.x, t.y, R) then break end
-        local id = fgIdAt(t.x, t.y)
-        local r = tryBreak(t.x, t.y, false) -- pohon siap: 1 pukulan = panen
-        if r == "broke" then
-            FC.onHarvest(id)
-            got += 1
-            FC.status("Panen " .. itemName(id) .. " (" .. t.x .. "," .. t.y .. ")")
-        else
-            skipTile(FC.skip, t.idx, 30)
-        end
-        done += 1
-        if not waitAuto(FC.hms) then return done end
-    end
-    -- ambil hasil panen dulu sebelum pindah / tanam
-    if got > 0 and FC.collect then
-        FC.status("Ambil hasil panen...")
-        task.wait(0.25) -- drop panen muncul sedikit terlambat
-        if not FC.run() or not alive() then return done end
-        -- susuri baris ini sampai drop terjauh (terambil sambil lewat, tanpa berhenti)
-        if Move.fetchDrops(FC.run, 8, function(d) return abs(d.y - cy) <= 1.6 end, 10) > 0 then return done end
-    end
-    for _, t in ipairs(plant) do
-        if not FC.run() or not alive() then return done end
-        if fcSeeds() <= 0 then break end
-        local cur = playerState()
-        if not cur or not stateReaches(cur, t.x, t.y, R) then return done end
-        if fgIdAt(t.x, t.y) == 0 then
-            if not plantSeed(t.x, t.y) then break end
-            done += 1
-            if not waitAuto(FC.pms) then return done end
-        end
-    end
-    return done
-end
-
--- Cari target + kapan pohon berikutnya siap.
---   Panen : pohon siap terdekat (didahulukan).
---   Tanam : rapi per baris. Selesaikan 1 baris dulu (baris yang sedang dikerjakan,
---           atau baris terdekat dengan karakter), dari tile paling kiri ke kanan.
-local function farmerScan(px, py, maxN, filter)
-    local w = Refs.World
-    local W, H = w.w, w.h
-    local best = {}
-    local now = os.clock()
-    local st = workspace:GetServerTimeNow()
-    local nextReady = nil
-    local doPlant = FC.plant and fcSeeds() > 0
-    local rows = {} -- [y] = daftar tempat tanam di baris itu
-    local scanned = 0
-    for y = 0, H - 1 do
-        local frow, below = w.fg[y], w.fg[y + 1]
-        for x = 0, W - 1 do
-            local id = frow and frow[x] or 0
-            if id ~= 0 then
-                if fcHarvestOk(x, y) and (not FC.only or id == FC.only) then
-                    local ra = treeReadyAt(x, y, id)
-                    if ra and st >= ra then
-                        local idx = y * W + x
-                        if not skipped(FC.skip, idx, now) then
-                            if filter and not filter[idx] then
-                                skipTile(FC.skip, idx, 60)
-                            else
-                                local dx, dy = x - px, (y - py) * 1.3
-                                local d = dx * dx + dy * dy
-                                if #best < maxN or d < best[#best].d then
-                                    if canWorkAt(x, y) then
-                                        local pos = #best + 1
-                                        while pos > 1 and best[pos - 1].d > d do pos -= 1 end
-                                        table.insert(best, pos, { x = x, y = y, idx = idx, d = d, kind = "harvest" })
-                                        if #best > maxN then best[#best] = nil end
-                                    else
-                                        skipTile(FC.skip, idx, 120)
-                                    end
-                                end
-                            end
-                        end
-                    elseif ra and (not nextReady or ra - st < nextReady) then
-                        nextReady = ra - st
-                    end
-                end
-            elseif doPlant then
-                local b = below and below[x] or 0
-                local idx = y * W + x
-                if b ~= 0 and fcPlantOk(idx) and not skipped(FC.skip, idx, now) then
-                    if filter and not filter[idx] then
-                        skipTile(FC.skip, idx, 60)
-                    else
-                        local r = rows[y]
-                        if not r then
-                            r = {}
-                            rows[y] = r
-                        end
-                        r[#r + 1] = { x = x, y = y, idx = idx, kind = "plant" }
-                    end
-                end
-            end
-        end
-        scanned += W
-        if scanned >= 6000 then
-            scanned = 0
-            task.wait()
-            if not FC.run() or not alive() then break end
-        end
-    end
-    if #best > 0 or not doPlant then return best, nextReady end
-
-    -- tanam rapi: baris yang sedang dikerjakan dulu, lalu baris terdekat
-    local lock = FC.row and FC.row.y
-    local order = {}
-    for y in pairs(rows) do order[#order + 1] = y end
-    local function rowKey(y) return (y == lock) and -1 or math.abs(y - py) end
-    table.sort(order, function(a, b)
-        local ka, kb = rowKey(a), rowKey(b)
-        if ka ~= kb then return ka < kb end
-        return a < b
-    end)
-    for _, y in ipairs(order) do
-        local list = rows[y]
-        table.sort(list, function(a, b) return a.x < b.x end) -- dari kiri ke kanan
-        for _, t in ipairs(list) do
-            if plantSpotOk(t.x, t.y, FC.seed) then
-                if FC.row then FC.row.y = y end
-                return { t }, nextReady
-            end
-            skipTile(FC.skip, t.idx, 120)
-        end
-    end
-    if FC.row then FC.row.y = nil end
-    return best, nextReady
-end
-
-local lastFarmerText = nil
-local function updateFarmerStatus()
-    if Refs.World and not Refs.Trees and os.clock() >= (Auto.nextTreeScan or 0) then
-        Auto.nextTreeScan = os.clock() + 15
-        pcall(findTreeRefs)
-    end
-    if not UI.FarmerStatus then return end
-    local seed = Farmer.SeedId
-    local txt = "Status  : " .. (Farmer.Running and "JALAN" or "BERHENTI")
-        .. "\nPanen   : " .. Farmer.Harvested .. "  | tanam: " .. Farmer.Planted .. "  | collect: " .. State.Collected
-        .. "\nSeed    : " .. (seed and (itemName(seed) .. " x" .. invCount(seed)) or "-")
-        .. "\nPohon   : " .. (Refs.Trees and "terbaca" or "TIDAK terbaca (harvest mati)")
-        .. "\nPijakan : " .. blockText(Farmer.UseBlock, Farmer.ScaffoldId)
-        .. "\nDrop    : " .. ((Pabrik.pointSet and Pabrik.pointSet()) and ("otomatis saat >= " .. Farmer.DropAt
-            .. " | di-drop " .. Farmer.Dropped) or "titik drop belum diatur")
-        .. "\nAksi    : " .. Farmer.Status
-    if txt == lastFarmerText then return end
-    lastFarmerText = txt
-    task.defer(function()
-        pcall(function() UI.FarmerStatus:SetDesc(txt) end)
-    end)
-end
-
--- 1 langkah mesin panen/tanam (pakai FC):
---   kerjakan yang terjangkau, atau jalan ke target terdekat.
--- Hasil: "work" | "move" | "wait" | "idle" (+ detik ke pohon siap berikutnya)
--- Tersangkut lama di udara / pinggir block (bikin karakter diam): dorong sedikit ke samping
-function Move.airCheck(s)
-    if s.grounded then
-        Move.AirAt = nil
-        return
-    end
-    if not Move.AirAt then
-        Move.AirAt = os.clock()
-    elseif os.clock() - Move.AirAt > 3 then
-        Move.AirAt = nil
-        local right = (s.facing or 1) < 0 -- ke arah sebaliknya
-        AutoInput.active = true
-        AutoInput.right, AutoInput.left = right, not right
-        task.wait(0.2)
-        AutoInput.right, AutoInput.left = false, false
-    end
-end
-
-local function fieldStep()
-    local w = Refs.World
-    local s = playerState()
-    if not w or not s or s.dead then
-        releaseInput()
-        task.wait(0.5)
-        return "wait"
-    end
-    if not s.grounded then
-        releaseInput()
-        Move.airCheck(s)
-        task.wait()
-        return "wait"
-    end
-    Move.AirAt = nil
-    releaseInput()
-    if farmerWorkInReach(s) > 0 then return "work" end
-    local R = farmReach() - 0.35
-    local useBlock = scaffoldId() ~= nil
-    local sx, sy = startNode(s)
-    local px, py = floor(s.x), floor(s.y - 0.475)
-    local targets, nextReady = farmerScan(px, py, 8, reachFilter(sy * w.w + sx, R, useBlock))
-    if not FC.run() or not alive() then return "wait" end
-    if #targets == 0 then return "idle", nextReady end
-    targets.los = targets[1].kind == "harvest" -- panen: berdiri di baris pohon (drop terambil)
-    travelGroup(sx, sy, targets, R, useBlock, FC.skip, FarmerFail)
-    return "move"
-end
-
--- Item hasil panen yang sudah hampir penuh: seed pohon & block-nya
-function Farmer.dropList()
-    local out = {}
-    for sid in pairs(Farmer.Got) do
-        for _, id in ipairs({ sid, sid - 1 }) do
-            local it = ItemDB[id]
-            if it and (id == sid or it.kind ~= "seed") then
-                local n = invCount(id)
-                local keep = (id == Farmer.SeedId) and Farmer.Keep or 0
-                if n >= Farmer.DropAt and n > keep then
-                    out[#out + 1] = { id = id, n = n - keep }
-                end
-            end
-        end
-    end
-    return out
-end
-
-local function farmerLoop()
-    local lastUi = 0
-    while Farmer.Running and alive() do
-        task.wait()
-        if os.clock() - lastUi > 0.5 then
-            lastUi = os.clock()
-            updateFarmerStatus()
-        end
-        FC = farmerCfg()
-        if not Refs.World then
-            Farmer.Status = "Menunggu karakter / world..."
-            task.wait(0.5)
-            continue
-        end
-        -- inventori hampir penuh -> drop hasil panen ke titik drop
-        if Pabrik.pointSet and Pabrik.pointSet() and Auto.dropTrip and os.clock() >= (Farmer.DropOffUntil or 0)
-            and os.clock() - (Farmer.DropCheck or 0) > 2 then
-            Farmer.DropCheck = os.clock()
-            local items = Farmer.dropList()
-            if #items > 0 then
-                releaseInput()
-                local ok, why = Auto.dropTrip(items, function() return Farmer.Running and alive() end,
-                    function(t) Farmer.Status = t end)
-                for _, it in ipairs(items) do Farmer.Dropped += it.got or 0 end
-                if why == "home" then
-                    stopFarmer("Gagal pulang ke world farmer")
-                    break
-                end
-                if not ok then Farmer.DropOffUntil = os.clock() + ((why == "nopoint") and 60 or 120) end
-                continue
-            end
-        end
-        local r, nextReady = fieldStep()
-        if r == "wait" and not playerState() then
-            Farmer.Status = "Menunggu karakter / world..."
-        end
-        if r == "idle" then
-            local parts = {}
-            if Farmer.Harvest then
-                parts[#parts + 1] = nextReady and ("pohon siap ±" .. math.ceil(nextReady) .. " dtk") or "tidak ada pohon"
-            end
-            if Farmer.Plant then
-                parts[#parts + 1] = (seedCount() <= 0) and "seed habis / belum dipilih" or "tidak ada tempat tanam"
-            end
-            Farmer.Status = "Menunggu: " .. table.concat(parts, ", ")
-            if not waitAuto(1000) then break end
-        end
-    end
-    releaseInput()
-end
-
-local function setFarmerVisual()
-    if UI.FarmerToggle then pcall(function() UI.FarmerToggle:Set(Farmer.Running) end) end
-end
-
-stopFarmer = function(reason)
-    Farmer.Running = false
-    autoEnd()
-    setFarmerVisual()
-    Farmer.Status = reason or "Dihentikan"
-    if reason then
-        notify("Farmer", reason, 5)
-        if not string.find(reason, "^Dihentikan") then Hook.send("stop", "Farmer berhenti: " .. reason) end
-    end
-    updateFarmerStatus()
-end
-
-local function startFarmer()
-    if Farmer.Running then return end
-    local err = checkAutoStart()
-    if not err and not Farmer.Harvest and not Farmer.Plant then
-        err = "Aktifkan Auto Harvest atau Auto Plant"
-    end
-    if not err and not Farmer.Harvest and not Farmer.SeedId then
-        err = "Pilih seed dulu untuk Auto Plant"
-    end
-    if err then
-        notify("Farmer", err, 4)
-        setFarmerVisual()
-        return
-    end
-    if Farmer.Harvest and not Refs.Trees and not findTreeRefs() then
-        notify("Farmer", "Data pohon tidak ketemu: Auto Harvest tidak bisa cek pohon siap", 5)
-    end
-    if Splice.Running and Splice.stop then Splice.stop("Dihentikan karena Farmer dimulai") end
-    if Pabrik.Running and Pabrik.stop then Pabrik.stop("Dihentikan karena Farmer dimulai") end
-    if Build.Running and Build.stop then Build.stop("Dihentikan karena Farmer dimulai") end
-    if State.Running then stopFarm("Dihentikan karena Farmer dimulai") end
-    if Clear.Running then stopClear("Dihentikan karena Farmer dimulai") end
-    table.clear(Farmer.Skip)
-    table.clear(FarmerFail)
-    table.clear(BadEdge)
-    table.clear(Farmer.Row)
-    Farmer.DropOffUntil = 0
-    Farmer.Status = "Mulai..."
-    Farmer.Running = true
-    autoBegin()
-    setFarmerVisual()
-    updateFarmerStatus()
-    task.spawn(function()
-        local ok, e = pcall(farmerLoop)
-        if not ok then
-            warn("[Zekio supreme] Farmer error: " .. tostring(e))
-            if Farmer.Running then stopFarmer("Error: " .. tostring(e)) end
-        end
-    end)
-end
-
----------------------------------------------------------------------
--- SPLICE KELILING: tanam Seed A + splice Seed B di seluruh world
----------------------------------------------------------------------
--- Cara kerja (sama seperti Farmer, tapi aksinya splice):
---   1. Kerjakan semua tile yang terjangkau dari posisi sekarang:
---        tile kosong (di bawahnya block) -> tanam A, lalu splice B ke pohon A itu
---        pohon A yang belum di-splice     -> splice B
---   2. Kalau tidak ada lagi yang terjangkau: cari tile terdekat, jalan ke sana pakai A*.
---   Pohon yang sudah siap panen tidak bisa di-splice (aturan game), jadi dilewati.
-local SpliceFail = {}
-
-local function spliceInv()
-    return invCount(Splice.A or 0), invCount(Splice.B or 0)
-end
-
--- Jenis kerja di tile ini: "plant" | "splice" | nil
-local function spliceKind(x, y, st)
-    local A = Splice.A
-    local id = fgIdAt(x, y)
-    if id == 0 then
-        local a, b = spliceInv()
-        if a > 0 and b > 0 and plantSpotOk(x, y, A) then return "plant" end
-        return nil
-    end
-    if id ~= A then return nil end
-    local t = Auto.treeEntry(x, y)
-    if type(t) == "table" and t.s == true then return nil end -- sudah di-splice
-    local ra = treeReadyAt(x, y, id)
-    if ra and st >= ra then return nil end -- sudah siap panen
-    local _, b = spliceInv()
-    if b > 0 and canWorkAt(x, y) then return "splice" end
-    return nil
-end
-
-local function spliceOnce(x, y)
-    local w = Refs.World
-    local f = w and rawget(w, "spliceSeed")
-    if type(f) ~= "function" then return false, "fungsi splice game tidak ketemu" end
-    local ok, made = pcall(f, x, y, Splice.B)
-    if ok and made and ItemDB[made] then
-        pcall(function() Refs.Inv:remove(Splice.B, 1) end)
-        if Refs.SetTile then pcall(Refs.SetTile, "fg", x, y, made, true) end -- ganti di layar saja
-        Splice.Made += 1
-        Splice.Status = ("Splice jadi %s (%d,%d)"):format(itemName(made), x, y)
-        return true
-    end
-    return false, "ditolak server"
-end
-
--- Kerjakan 1 tile: tanam A (kalau kosong) lalu splice B
-local function spliceTile(t)
-    local A = Splice.A
-    if fgIdAt(t.x, t.y) == 0 then
-        if invCount(A) <= 0 then return false end
-        sendSetTile("fg", t.x, t.y, A)
-        pcall(function() Refs.Inv:remove(A, 1) end)
-        Splice.Planted += 1
-        Splice.Status = ("Tanam %s (%d,%d)"):format(itemName(A), t.x, t.y)
-        if not waitAuto(Splice.Ms) then return false end
-    end
-    if fgIdAt(t.x, t.y) ~= A then
-        skipTile(Splice.Skip, t.idx, 30)
-        return true
-    end
-    local ok, why = spliceOnce(t.x, t.y)
-    if not ok then
-        SpliceFail[t.idx] = (SpliceFail[t.idx] or 0) + 1
-        skipTile(Splice.Skip, t.idx, 60)
-        Splice.Status = ("Gagal splice (%d,%d): %s"):format(t.x, t.y, tostring(why))
-    end
-    waitAuto(Splice.Ms)
-    return true
-end
-
-local function spliceWorkInReach(s)
-    local w = Refs.World
-    local W = w.w
-    local R = farmReach() - 0.08
-    local cx, cy = s.x, s.y - 0.475
-    local now = os.clock()
-    local st = workspace:GetServerTimeNow()
-    local list = {}
-    for ty = math.max(0, floor(cy - R - 0.5)), math.min(floor(cy + R + 0.5), w.h - 1) do
-        for tx = math.max(0, floor(cx - R - 0.5)), math.min(floor(cx + R + 0.5), W - 1) do
-            if stateReaches(s, tx, ty, R) then
-                local idx = ty * W + tx
-                if Splice.Row.y == ty and not skipped(Splice.Skip, idx, now) and spliceKind(tx, ty, st) then
-                    list[#list + 1] = { x = tx, y = ty, idx = idx }
-                end
-            end
-        end
-    end
-    table.sort(list, function(a, b)
-        if a.x ~= b.x then return a.x < b.x end
-        return a.y < b.y
-    end)
-    local done = 0
-    for _, t in ipairs(list) do
-        if not Splice.Roaming or not alive() then return done end
-        local cur = playerState()
-        if not cur or not stateReaches(cur, t.x, t.y, R) then return done end
-        if not spliceTile(t) then return done end
-        done += 1
-    end
-    return done
-end
-
--- Tile kerja berikutnya: rapi per baris (baris yang sedang dikerjakan / terdekat),
--- dari kiri ke kanan
-local function spliceScan(px, py, maxN, filter)
-    local w = Refs.World
-    local W, H = w.w, w.h
-    local now = os.clock()
-    local st = workspace:GetServerTimeNow()
-    local rows = {} -- [y] = tile kerja paling kiri di baris itu
-    local scanned = 0
-    for y = 0, H - 1 do
-        for x = 0, W - 1 do
-            local idx = y * W + x
-            if not rows[y] and not skipped(Splice.Skip, idx, now) and spliceKind(x, y, st) then
-                if filter and not filter[idx] then
-                    skipTile(Splice.Skip, idx, 60)
-                else
-                    rows[y] = { x = x, y = y, idx = idx }
-                end
-            end
-        end
-        scanned += W
-        if scanned > 6000 then
-            scanned = 0
-            task.wait()
-            if not Splice.Roaming then return {} end
-        end
-    end
-    local lock, pick, pk = Splice.Row.y, nil, nil
-    for y, t in pairs(rows) do
-        local k = (y == lock) and -1 or math.abs(y - py)
-        if not pick or k < pk or (k == pk and y < pick.y) then pick, pk = t, k end
-    end
-    Splice.Row.y = pick and pick.y or nil
-    return pick and { pick } or {}
-end
-
-local function spliceRoamLoop(runId)
-    while Splice.Roaming and Splice.Running and alive() and Splice.RunId == runId do
-        task.wait()
-        local w = Refs.World
-        local s = playerState()
-        if not w or not s or s.dead then
-            releaseInput()
-            Splice.Status = "Menunggu karakter / world..."
-            task.wait(0.5)
-            continue
-        end
-        if not s.grounded then
-            releaseInput()
-            continue
-        end
-        releaseInput()
-        local a, b = spliceInv()
-        if b <= 0 then
-            if Splice.stop then Splice.stop("Seed habis") end
-            break
-        end
-        -- 1) kerjakan yang terjangkau
-        if spliceWorkInReach(s) > 0 then continue end
-        -- 2) jalan ke tile terdekat
-        local R = farmReach() - 0.35
-        local sx, sy = startNode(s)
-        local px, py = floor(s.x), floor(s.y - 0.475)
-        local targets = spliceScan(px, py, 8, reachFilter(sy * w.w + sx, R, false))
-        if not Splice.Roaming or not alive() then break end
-        if #targets == 0 then
-            Splice.Status = (a <= 0) and "Seed A habis, tidak ada pohon A yang bisa di-splice"
-                or "Menunggu: tidak ada tempat tanam / pohon untuk di-splice"
-            if not waitAuto(1000) then break end
-            continue
-        end
-        travelGroup(sx, sy, targets, R, false, Splice.Skip, SpliceFail)
-    end
-    releaseInput()
-end
-
-local function startSpliceRoam()
-    if not OrigIsDown then return "Kontrol gerak game (WorldMenu.isDown) tidak ketemu" end
-    table.clear(Splice.Row)
-    if not playerState() then return "Kamu belum masuk world" end
-    if not Refs.Trees then findTreeRefs() end
-    table.clear(Splice.Skip)
-    table.clear(SpliceFail)
-    table.clear(BadEdge)
-    Splice.Roaming = true
-    autoBegin()
-    local id = Splice.RunId
-    task.spawn(function()
-        local ok, e = pcall(spliceRoamLoop, id)
-        if not ok then
-            warn("[Zekio supreme] Splice error: " .. tostring(e))
-            if Splice.Running and Splice.stop then Splice.stop("Error: " .. tostring(e)) end
-        end
-    end)
-    return nil
-end
-
-local function stopSpliceRoam()
-    Splice.Roaming = false
-    autoEnd()
-    releaseInput()
-end
-
--- Jalan ke 1 tile tertentu (dipakai Penjaga: balik ke posisi Auto Farm).
--- Pakai A* yang sama, tanpa taruh block.
-local function walkTo(tx, ty, maxSec)
-    local w = Refs.World
-    if not w or not OrigIsDown then return false end
-    if tx < 0 or ty < 0 or tx >= w.w or ty >= w.h then return false end
-    Move.Homing = true
-    autoBegin()
-    local goal = { [ty * w.w + tx] = true }
-    local t0, ok = os.clock(), false
-    while alive() and Move.Homing and os.clock() - t0 < (maxSec or 30) do
-        local s = playerState()
-        if not s or s.dead then
-            task.wait(0.3) -- tunggu respawn / world selesai dimuat
-        else
-            local sx, sy = startNode(s)
-            if sx == tx and sy == ty and s.grounded then
-                ok = true
-                break
-            end
-            local path = astar(sx, sy, goal, tx, ty, 0.5, false)
-            if not path then break end -- tidak ada jalan
-            if #path > 0 then followPath(path) end
-            releaseInput()
-            task.wait(0.15)
-        end
-    end
-    Move.Homing = false
-    autoEnd()
-    return ok
-end
-
----------------------------------------------------------------------
--- LAHAN: bentuk farm world
----------------------------------------------------------------------
--- Baris block dari Y atas ke bawah, selalu 1 tile kosong di antaranya (tempat pohon & jalan).
--- Jumlah baris otomatis: turun terus menembus tanah sampai bedrock. Kalau bedrock jatuh di baris
--- lahan, bedrock itu jadi lantai baris terakhir (tanah tepat di atas bedrock ikut digali).
--- (tanah di celah baris digali Bangun Lahan, tanah di baris lahan dipakai sebagai lahan).
--- Kedua ujung baris dibuat tangga (lihat landCols).
--- Hasil disimpan sebentar (dipanggil sangat sering oleh Pabrik / status).
-local function landRows()
-    local w = Refs.World
-    if not w then return {} end
-    local x0 = math.clamp(math.floor(math.min(Land.X0, Land.X1)), 0, w.w - 1)
-    local x1 = math.clamp(math.floor(math.max(Land.X0, Land.X1)), 0, w.w - 1)
-    local y0 = math.max(1, math.floor(Land.Y0))
-    local c = Land.Cache
-    local now = os.clock()
-    if c and c.w == w and c.x0 == x0 and c.x1 == x1 and c.y0 == y0 and now - c.at < 2 then
-        return c.rows
-    end
-    local rows = {}
-    local span = x1 - x0 + 1
-    -- block yang tidak bisa dipecah (bedrock dll)
-    local function hard(x, y)
-        local id = fgIdAt(x, y)
-        if id == 0 then return false end
-        local it = ItemDB[id]
-        return it ~= nil and it.solid == true and not canBreak(id)
-    end
-    local y = y0
-    while y <= w.h - 2 and #rows < 40 do
-        local hg, hr = 0, 0
-        for x = x0, x1 do
-            if hard(x, y - 1) then hg += 1 end
-            if hard(x, y) then hr += 1 end
-        end
-        if hg * 2 > span then break end -- celahnya bedrock: berhenti
-        rows[#rows + 1] = y
-        if hr * 2 > span then break end -- baris ini bedrock: jadi lantai paling bawah
-        y += 2
-    end
-    Land.Cache = { w = w, x0 = x0, x1 = x1, y0 = y0, at = now, rows = rows }
-    return rows
-end
-
--- Tile lahan sudah jadi? (block padat apa saja, bukan pohon / lava / duri)
-function Build.done(x, y)
-    local id = fgIdAt(x, y)
-    if id == 0 then return false end
-    local it = ItemDB[id]
-    if not it or it.kind == "seed" or not it.solid then return false end
-    return not (it.deadly or it.hurts or it.laser)
-end
-
--- Kolom block baris ke-k (0 = paling atas). Tangga 2 kolom di KIRI dan KANAN:
---   baris ke-1, 3, 5.. : x0+1 .. x1-1              (kolom x0 & x1 kosong)
---   baris ke-2, 4, 6.. : x0, x0+2 .. x1-2, x1      (kolom x0+1 & x1-1 kosong)
--- Jadi dari ujung mana saja bisa turun (jatuh 2 tile ke anak tangga di bawahnya)
--- dan naik (lompat 2 tile), selang-seling seperti tangga.
-local function landCols(k)
-    local w = Refs.World
-    local x0 = math.clamp(math.floor(math.min(Land.X0, Land.X1)), 0, w.w - 1)
-    local x1 = math.clamp(math.floor(math.max(Land.X0, Land.X1)), 0, w.w - 1)
-    local cols = {}
-    if x1 - x0 < 4 then -- terlalu sempit untuk tangga
-        for x = x0, x1 do cols[#cols + 1] = x end
-    elseif k % 2 == 0 then
-        for x = x0 + 1, x1 - 1 do cols[#cols + 1] = x end
-    else
-        cols[#cols + 1] = x0
-        for x = x0 + 2, x1 - 2 do cols[#cols + 1] = x end
-        cols[#cols + 1] = x1
-    end
-    return cols
-end
-
-local function inLandRect(x, y)
-    local rows = landRows()
-    if #rows == 0 then return false end
-    local x0 = math.min(Land.X0, Land.X1)
-    local x1 = math.max(Land.X0, Land.X1)
-    return x >= x0 and x <= x1 and y >= rows[1] - 1 and y <= rows[#rows]
-end
-
--- Tile block lahan: [idx] = true
-local function landBlockSet()
-    local set = {}
-    local w = Refs.World
-    if not w then return set end
-    for k, y in ipairs(landRows()) do
-        for _, x in ipairs(landCols(k - 1)) do set[y * w.w + x] = true end
-    end
-    return set
-end
-
--- Tile tanam lahan (di atas block yang sudah terpasang): [idx] = true
-local function landPlantSet()
-    local set = {}
-    local w = Refs.World
-    if not w then return set end
-    for k, y in ipairs(landRows()) do
-        for _, x in ipairs(landCols(k - 1)) do
-            if fgIdAt(x, y) ~= 0 and y - 1 >= 0 then set[(y - 1) * w.w + x] = true end
-        end
-    end
-    return set
-end
-
--- Hitung kebutuhan block lahan (+ sisa tile yang harus digali)
-local function landInfo(blockId, P0, carve0)
-    local info = { rows = 0, total = 0, need = 0, done = 0, blocked = 0, carve = 0 }
-    local w = Refs.World
-    if not w then return info end
-    local rows = landRows()
-    info.rows = #rows
-    for k, y in ipairs(rows) do
-        for _, x in ipairs(landCols(k - 1)) do
-            info.total += 1
-            if Build.done(x, y) then
-                info.done += 1
-            else
-                info.need += 1
-                if fgIdAt(x, y) ~= 0 then info.blocked += 1 end -- pohon / lava dll: dipecah dulu lalu dipasang
-            end
-        end
-    end
-    if carve0 then
-        info.carve = #carve0
-    else
-        local P = P0 or (Build.plan and Build.plan())
-        if P then info.carve = #Build.carveList(P) end
-    end
-    return info
-end
-
--- Seed <-> block (seed biasanya id block + 1, kecuali item khusus yang punya seedId)
-local function seedOfBlock(block)
-    local it = block and ItemDB[block]
-    if not it then return nil end
-    local sid = it.seedId or (block + 1)
-    local sd = ItemDB[sid]
-    if sd and sd.kind == "seed" then return sid end
-    return nil
-end
-
-local function blockOfSeed(seed)
-    if not seed then return nil end
-    local b = seed - 1
-    local it = ItemDB[b]
-    if it and it.kind ~= "seed" and (it.seedId == nil or it.seedId == seed) then return b end
-    return nil
-end
-
-local function readyTreeCount(whole, only)
-    local w = Refs.World
-    if not w then return 0 end
-    local st = workspace:GetServerTimeNow()
-    local x0, x1, y0, y1 = 0, w.w - 1, 0, w.h - 1
-    if not whole then
-        local rows = landRows()
-        if #rows == 0 then return 0 end
-        x0 = math.max(0, math.min(Land.X0, Land.X1))
-        x1 = math.min(w.w - 1, math.max(Land.X0, Land.X1))
-        y0, y1 = math.max(0, rows[1] - 1), rows[#rows]
-    end
-    local n, nxt = 0, nil
-    for y = y0, y1 do
-        for x = x0, x1 do
-            local id = fgIdAt(x, y)
-            if id ~= 0 and (not only or id == only) then
-                local ra = treeReadyAt(x, y, id)
-                if ra then
-                    if st >= ra then
-                        n += 1
-                    elseif not nxt or ra - st < nxt then
-                        nxt = ra - st
-                    end
-                end
-            end
-        end
-    end
-    return n, nxt
-end
-
----------------------------------------------------------------------
--- PABRIK
----------------------------------------------------------------------
--- Fase (berputar terus):
---   PANEN : panen semua pohon siap di lahan (berhenti kalau block / seed hampir 200)
---   TANAM : tanam seed di semua tile lahan yang kosong
---   BREAK : jalan ke posisi break, Auto Farm (place + break) di tile pabrik sampai block HABIS
---           (tidak diselingi cek pohon; berhenti hanya kalau seed harus di-drop / penuh / macet)
---   TUNGGU: tunggu pohon siap, lalu kembali ke PANEN
---   Kapan saja seed >= batas drop -> pergi drop (seed - sisakan), lalu pulang.
--- Inventori maksimal 200 per item, jadi semua fase dijaga supaya tidak penuh.
--- Drop yang jatuh di tempat drop tidak di-collect lagi.
-local BOOT_SEEDS = 10 -- (mode produksi) cukup seed segini untuk mulai tanam
-local CAP = 190       -- batas aman jumlah item (maksimal 200 per item)
-
-local function pabrikCfg(o, harvest, plant)
-    local plantSet, area = nil, nil
-    if not o.whole then
-        plantSet = landPlantSet()
-        area = inLandRect
-    end
-    return {
-        run = o.live,
-        harvest = harvest,
-        plant = plant and invCount(o.seed) > 0,
-        seed = o.seed,
-        skip = Pabrik.Skip,
-        hms = Farmer.HarvestMs,
-        pms = Farmer.PlantMs,
-        area = area,
-        plantSet = plantSet,
-        exclude = o.exclude,
-        row = Pabrik.Row,
-        collect = true,
-        status = function(t) Pabrik.Status = t end,
-        onHarvest = function() Pabrik.Harvested += 1 end,
-        onPlant = function() Pabrik.Planted += 1 end,
-    }
-end
-
--- Break block di posisi pabrik (pakai Auto Farm dengan tile & block pabrik)
-local function pabrikBreak(o)
-    if os.clock() < (Pabrik.BreakFailUntil or 0) then return false end
-    local s = playerState()
-    if not s then return false end
-    local hx, hy = startNode(s)
-    if hx ~= Pabrik.BreakX or hy ~= Pabrik.BreakY then
-        Pabrik.Status = ("Jalan ke posisi break (%d,%d)"):format(Pabrik.BreakX, Pabrik.BreakY)
-        if not walkTo(Pabrik.BreakX, Pabrik.BreakY, 45) then
-            Pabrik.Status = "Gagal jalan ke posisi break, dicoba lagi nanti"
-            Pabrik.BreakFailUntil = os.clock() + 30
-            return false
-        end
-    end
-    if not o.live() then return false end
-    State.Override = { offsets = Pabrik.Tiles, block = o.block, mode = "Place + Break" }
-    State.Quiet = true
-    table.clear(HitCount)
-    table.clear(PlacedAt)
-    State.Running = true
-    State.RunId = (State.RunId or 0) + 1
-    local id = State.RunId
-    local acts0 = State.Placed + State.Broken
-    local lastActs, lastActAt = acts0, os.clock()
-    task.spawn(function() -- pengawas sesi break
-        while State.Running and State.RunId == id do
-            task.wait(1)
-            local sd = invCount(o.seed)
-            local acts = State.Placed + State.Broken
-            if acts ~= lastActs then lastActs, lastActAt = acts, os.clock() end
-            -- break terus sampai block habis (tanpa batas waktu sesi)
-            if not o.live() or sd >= CAP
-                or (o.drop and Pabrik.Drop and sd >= Pabrik.DropAt)
-                or (o.breakMode ~= "always" and sd >= BOOT_SEEDS)
-                or os.clock() - lastActAt > 8 then -- 8 detik tidak ada place / pukul: jangan diam di sini
-                State.Running = false
-            end
-        end
-    end)
-    Pabrik.Status = "Break " .. itemName(o.block) .. " di posisi pabrik"
-    local ok, e = pcall(farmLoop, id)
-    if not ok then warn("[Zekio supreme] Pabrik break error: " .. tostring(e)) end
-    State.Running = false
-    State.Override = nil
-    State.Quiet = false
-    if State.Placed + State.Broken == acts0 and invCount(o.block) > 0 then
-        Pabrik.BreakFailUntil = os.clock() + 60
-        Pabrik.Status = "Sesi break tanpa aksi: cek posisi & tile break (dicoba lagi 1 menit)"
-    end
-    return true
-end
-
--- "WORLD" / "WORLD:ID" / ":ID" -> nama world, id pintu
-local function parseDropTarget()
-    local raw = tostring(Pabrik.DropWorld or ""):gsub("%s", "")
-    local name, door = string.match(raw, "^([^:]*):(.+)$")
-    if not name then name = raw end
-    name = string.upper(name):gsub("[^A-Z0-9]", "")
-    if door == "" then door = nil end
-    return name, door
-end
-
--- Pindah world (lewat menu game), bisa langsung ke pintu tertentu
-local function goWorld(name, door)
-    if Guard.worldName() ~= "" then
-        Guard.leaveWorld()
-        task.wait(2)
-    end
-    if door and Refs.World then rawset(Refs.World, "arriveDoor", door) end
-    local ok, err = Guard.enterWorld(name)
-    if ok then
-        task.wait(1.5)
-        Guard.afterEnter()
-    end
-    return ok, err
-end
-
--- Drop pakai fungsi drop game (item jatuh di depan karakter)
-local function dropItems(id, n, live)
-    local hud = Refs.Hud
-    local f = hud and rawget(hud, "onDrop")
-    if type(f) ~= "function" then return 0, "fungsi drop game tidak ketemu" end
-    local left, flipped = n, false
-    while left > 0 and live() do
-        local before = invCount(id)
-        pcall(f, id, math.min(left, 200))
-        task.wait(0.7) -- game menolak drop yang terlalu cepat (0.3 dtk)
-        local got = before - invCount(id)
-        if got > 0 then
-            left -= got
-        elseif not flipped then
-            -- di depan tembok / tidak boleh drop: hadap ke arah lain lalu coba lagi
-            flipped = true
-            local st = playerState()
-            local right = st and (st.facing or 1) < 0
-            AutoInput.active = true
-            AutoInput.right, AutoInput.left = right, not right
-            task.wait(0.06)
-            AutoInput.right, AutoInput.left = false, false
-            task.wait(0.3)
-        else
-            return n - left, "tidak bisa drop di posisi ini"
-        end
-    end
-    return n - left, nil
-end
-
--- Titik drop bersama (dipakai Pabrik, Farmer, Auto Farm):
--- pergi ke titik drop (bisa world lain / WORLD:ID), drop item, lalu pulang ke world asal.
--- items = { { id =, n = }, ... }  -> it.got diisi jumlah yang berhasil di-drop
--- Hasil: ok, alasan ("nopoint" | "home" | teks error)
-local function dropTrip(items, live, say)
-    say = say or function() end
-    local name, door = parseDropTarget()
-    local home = Guard.worldName()
-    if name == "" then name = home end
-    if Pabrik.DropX < 0 and not door and name == home then
-        say("Titik drop belum diatur (tab Titik Drop), drop dilewati")
-        return false, "nopoint"
-    end
-    Pabrik.Traveling = true
-    local away = name ~= home
-    local ok, why = true, nil
-    if away or door then
-        say("Pergi ke " .. name .. (door and (":" .. door) or "") .. " untuk drop")
-        local okw, err = goWorld(name, door)
-        if not okw then ok, why = false, "gagal masuk " .. name .. " (" .. tostring(err) .. ")" end
-    end
-    if ok and live() and Pabrik.DropX >= 0 then
-        say(("Jalan ke posisi drop (%d,%d)"):format(Pabrik.DropX, Pabrik.DropY))
-        if not walkTo(Pabrik.DropX, Pabrik.DropY, 60) then ok, why = false, "tidak bisa jalan ke posisi drop" end
-    end
-    if ok and live() then
-        local s = playerState()
-        if s then Pabrik.Zone = { world = Guard.worldName(), x = s.x, y = s.y - 0.475 } end
-        for _, it in ipairs(items) do
-            if not live() then break end
-            local got, err = dropItems(it.id, it.n, live)
-            it.got = got
-            if got > 0 then
-                local msg = ("Drop %s x%d di %s"):format(itemName(it.id), got, Guard.worldName())
-                say(msg)
-                notify("Drop", msg, 4)
-                Hook.send("pabrik", msg)
-            end
-            if err then
-                ok, why = false, err
-                break
-            end
-        end
-    end
-    if not ok then
-        say("Drop gagal: " .. tostring(why))
-        notify("Drop", "Drop gagal: " .. tostring(why), 5)
-        Hook.send("pabrik", "Drop gagal: " .. tostring(why))
-    end
-    -- pulang ke world asal
-    if away and home ~= "" and live() then
-        say("Pulang ke " .. home)
-        local okh = goWorld(home, nil)
-        if not okh and live() then
-            task.wait(5)
-            okh = goWorld(home, nil)
-        end
-        if not okh then
-            Pabrik.Traveling = false
-            autoEnd()
-            return false, "home"
-        end
-    end
-    Pabrik.Traveling = false
-    autoEnd()
-    return ok, why
-end
-Auto.dropTrip = dropTrip
-
--- Titik drop sudah diatur? (posisi, WORLD:ID, atau world lain)
-function Pabrik.pointSet()
-    if Pabrik.DropX >= 0 then return true end
-    local name, door = parseDropTarget()
-    if door then return true end
-    return name ~= "" and name ~= Guard.worldName()
-end
-
-local function pabrikDrop(seed, n, live)
-    local items = { { id = seed, n = n } }
-    local ok, why = dropTrip(items, live, function(t) Pabrik.Status = t end)
-    Pabrik.Dropped += items[1].got or 0
-    if why == "home" then
-        if Pabrik.stop then Pabrik.stop("Gagal pulang ke world pabrik " .. tostring(Pabrik.Home)) end
-    elseif not ok then
-        Pabrik.DropOffUntil = os.clock() + ((why == "nopoint") and 60 or 120)
-    end
-end
-
--- Auto Farm: seed hasil break sudah banyak -> jeda, drop seed ke titik drop,
--- balik ke posisi farm, lalu lanjut lagi (dicek tiap 2 detik)
-task.spawn(function()
-    while alive() do
-        task.wait(2)
-        local seed = State.SelectedId and seedOfBlock(State.SelectedId)
-        if State.Running and not State.Override and Pabrik.pointSet() and not State.DropPause and seed
-            and os.clock() >= (State.DropOffUntil or 0) then
-            local n = invCount(seed)
-            local s = playerState()
-            if s and n >= State.SeedDropAt and n > State.SeedKeep then
-                local hx, hy = startNode(s)
-                local runId = State.RunId
-                local function live() return State.Running and alive() and State.RunId == runId end
-                State.DropPause = true
-                task.wait(0.8) -- tunggu pukulan terakhir selesai
-                local items = { { id = seed, n = n - State.SeedKeep } }
-                local ok, why = dropTrip(items, live, function(t) State.LastAction = t end)
-                State.Dropped += items[1].got or 0
-                if not ok then State.DropOffUntil = os.clock() + ((why == "nopoint") and 60 or 120) end
-                if why == "home" then
-                    stopFarm("Gagal pulang ke world farm")
-                elseif live() then
-                    State.LastAction = ("Jalan balik ke posisi farm (%d,%d)"):format(hx, hy)
-                    if not walkTo(hx, hy, 60) then
-                        stopFarm("Gagal balik ke posisi farm, Auto Farm dihentikan")
-                    else
-                        State.LastAction = "Lanjut Auto Farm"
-                    end
-                end
-                State.DropPause = false
-            end
-        end
-    end
-end)
-
-local PHASE_NAME = { panen = "PANEN", tanam = "TANAM", ["break"] = "BREAK", tunggu = "TUNGGU" }
-
-local function breakReady()
-    return Pabrik.BreakX >= 0 and next(Pabrik.Tiles) ~= nil and os.clock() >= (Pabrik.BreakFailUntil or 0)
-end
-
--- 1 langkah pabrik. o = { seed, block, drop, breakMode, whole, exclude, live, phase }
--- Hasil: "drop" | "work" | "move" | "wait" | "break" | "next" | "idle" (+ detik ke pohon siap)
-local function pabrikStep(o)
-    local seeds, blocks = invCount(o.seed), invCount(o.block)
-    o.phase = o.phase or "panen"
-    Pabrik.Phase = PHASE_NAME[o.phase]
-    -- drop seed lebihan (kapan saja)
-    if o.drop and Pabrik.Drop and seeds >= Pabrik.DropAt and seeds > Pabrik.Keep
-        and os.clock() >= (Pabrik.DropOffUntil or 0) then
-        pabrikDrop(o.seed, seeds - Pabrik.Keep, o.live)
-        return "drop"
-    end
-
-    if o.phase == "panen" then
-        -- 1x panen bisa kena beberapa pohon, jadi sisakan ruang ~20 item
-        if blocks >= CAP - 20 or seeds >= CAP - 20 then
-            o.phase = "tanam"
-            return "next"
-        end
-        FC = pabrikCfg(o, true, false)
-        local r = fieldStep()
-        if r == "idle" then
-            o.idleAt = os.clock()
-            o.phase = "tanam"
-            return "next"
-        end
-        return r
-    end
-
-    if o.phase == "tanam" then
-        if seeds > 0 then
-            FC = pabrikCfg(o, false, true)
-            local r = fieldStep()
-            if r ~= "idle" then return r end
-        end
-        o.phase = "break"
-        return "next"
-    end
-
-    if o.phase == "break" then
-        local want
-        if o.breakMode == "always" then
-            want = blocks > 0
-        else -- mode produksi: break hanya untuk dapat seed awal
-            local _, nxt = readyTreeCount(o.whole)
-            want = blocks > 0 and seeds < BOOT_SEEDS and nxt == nil
-        end
-        if want and breakReady() and pabrikBreak(o) then
-            -- block masih ada: lanjut break (habiskan dulu), block habis: tanam
-            o.phase = (o.breakMode == "always" and invCount(o.block) > 0) and "break" or "tanam"
-            return "break"
-        end
-        o.phase = "tunggu"
-        return "next"
-    end
-
-    -- tunggu
-    local n, nxt = readyTreeCount(o.whole)
-    if n > 0 and os.clock() - (o.idleAt or 0) > 5 then
-        o.phase = "panen"
-        return "next"
-    end
-    if o.breakMode == "always" and blocks > 0 and breakReady() then
-        o.phase = "break"
-        return "next"
-    end
-    if seeds > 0 and os.clock() - (o.plantAt or 0) > 10 then
-        o.plantAt = os.clock() -- sesekali cek tile kosong (misal pohon dipanen orang lain)
-        o.phase = "tanam"
-        return "next"
-    end
-    return "idle", nxt, n
-end
-
-local function waitText(sec)
-    sec = math.max(0, math.ceil(sec or 0))
-    if sec >= 60 then return ("%dm %dd"):format(sec // 60, sec % 60) end
-    return sec .. " dtk"
-end
-
-local function pabrikLoop(runId)
-    local function live() return Pabrik.Running and alive() and Pabrik.RunId == runId end
-    local o = { seed = Pabrik.SeedId, block = Pabrik.BlockId, drop = true, breakMode = "always", live = live }
-    while live() do
-        task.wait()
-        o.whole = Pabrik.WholeWorld
-        local here = Guard.worldName()
-        if not Pabrik.Traveling and Pabrik.Home ~= "" and here ~= Pabrik.Home then
-            Pabrik.Status = "Bukan di world pabrik (" .. Pabrik.Home .. "), menunggu..."
-            task.wait(2)
-            continue
-        end
-        local r, nextReady, nReady = pabrikStep(o)
-        if r ~= "idle" then o.stuckAt = nil end
-        if r == "idle" then
-            local seeds, blocks = invCount(o.seed), invCount(o.block)
-            if not nextReady and (nReady or 0) == 0 and seeds <= 0 and blocks <= 0 then
-                if Pabrik.stop then Pabrik.stop("Seed & block habis, tidak ada pohon tumbuh") end
-                break
-            end
-            if (nReady or 0) > 0 then
-                -- ada pohon siap tapi tidak terjangkau: lama-lama reset daftar lewati & jalur
-                o.stuckAt = o.stuckAt or os.clock()
-                if os.clock() - o.stuckAt > 30 then
-                    o.stuckAt = nil
-                    table.clear(Pabrik.Skip)
-                    table.clear(BadEdge)
-                    Reach = nil
-                end
-            end
-            if seeds >= CAP - 20 and not (Pabrik.Drop and Pabrik.pointSet()) then
-                Pabrik.Status = ("Seed hampir penuh (%d): atur titik drop & nyalakan Auto drop seed"):format(seeds)
-            elseif (nReady or 0) > 0 then
-                Pabrik.Status = nReady .. " pohon siap belum terjangkau, dicoba lagi"
-            elseif nextReady then
-                Pabrik.Status = "Menunggu pohon siap ±" .. waitText(nextReady)
-            elseif blocks > 0 and (Pabrik.BreakX < 0 or next(Pabrik.Tiles) == nil) then
-                Pabrik.Status = "Ada block tapi posisi / tile break belum diatur"
-            elseif seeds > 0 then
-                Pabrik.Status = "Lahan penuh, menunggu"
-            else
-                Pabrik.Status = "Menunggu..."
-            end
-            if not waitAuto(1000) then break end
-        end
-    end
-    releaseInput()
-end
-
-function Pabrik.stop(reason)
-    Pabrik.Running = false
-    Pabrik.Traveling = false
-    if State.Override then State.Running = false end
-    autoEnd()
-    releaseInput()
-    Pabrik.Status = reason or "Dihentikan"
-    if UI.PabrikToggle then pcall(function() UI.PabrikToggle:Set(false) end) end
-    if reason then
-        notify("Pabrik", reason, 5)
-        if not string.find(reason, "^Dihentikan") then Hook.send("pabrik", "Pabrik berhenti: " .. reason) end
-    end
-end
-
-function Pabrik.start()
-    if Pabrik.Running then return end
-    local err
-    local block = blockOfSeed(Pabrik.SeedId)
-    if not Refs.World then
-        err = "Data world belum ketemu. Tekan 'Hubungkan ke game'"
-    elseif not OrigIsDown then
-        err = "Kontrol gerak game (WorldMenu.isDown) tidak ketemu"
-    elseif not playerState() then
-        err = "Kamu belum masuk world"
-    elseif not Pabrik.SeedId then
-        err = "Pilih seed pabrik dulu"
-    elseif not block then
-        err = "Block dari seed ini tidak ketemu"
-    elseif not Pabrik.WholeWorld and #landRows() == 0 then
-        err = "Atur lahan dulu (tab Lahan)"
-    end
-    if err then
-        notify("Pabrik", err, 4)
-        if UI.PabrikToggle then pcall(function() UI.PabrikToggle:Set(false) end) end
-        return
-    end
-    if State.Running and not State.Override then stopFarm("Dihentikan karena Pabrik dimulai") end
-    if Clear.Running then stopClear("Dihentikan karena Pabrik dimulai") end
-    if Farmer.Running then stopFarmer("Dihentikan karena Pabrik dimulai") end
-    if Splice.Running and Splice.stop then Splice.stop("Dihentikan karena Pabrik dimulai") end
-    if not Refs.Trees then findTreeRefs() end
-    Pabrik.BlockId = block
-    Pabrik.Home = Guard.worldName()
-    table.clear(Pabrik.Skip)
-    table.clear(Pabrik.Row)
-    table.clear(BadEdge)
-    Pabrik.DropOffUntil, Pabrik.BreakFailUntil = 0, 0
-    Pabrik.Running = true
-    Pabrik.RunId = (Pabrik.RunId or 0) + 1
-    Pabrik.Status = "Mulai..."
-    autoBegin()
-    if UI.PabrikToggle then pcall(function() UI.PabrikToggle:Set(true) end) end
-    local id = Pabrik.RunId
-    task.spawn(function()
-        local ok, e = pcall(pabrikLoop, id)
-        if not ok then
-            warn("[Zekio supreme] Pabrik error: " .. tostring(e))
-            if Pabrik.Running then Pabrik.stop("Error: " .. tostring(e)) end
-        end
-    end)
-end
-
----------------------------------------------------------------------
--- VENDING
----------------------------------------------------------------------
--- Mode "Isi stock dari drop":
---   1. Pergi ke titik drop vending (WORLD / WORLD:ID, kosong = world ini), tunggu di sana sampai ada drop
---      item yang dijual vending-mu (atau item apa saja kalau ada vending kosong), pungut (sentuhan badan).
---   2. Pulang ke world vending, tambah stock ke vending yang menjual item itu / masukkan ke vending kosong.
---   3. Ulangi. Pindah world hanya kalau ada yang dibawa (hemat, tidak bolak-balik terus).
--- Mode "Kosongkan sampai habis":
---   Ambil isi semua vending milikmu. Tas penuh / semua sudah diambil -> pergi ke titik drop vending,
---   drop semua, pulang, lanjut sampai semua vending kosong.
--- Aksi vending lewat fungsi game (World.vendCall), karakter harus berdiri di depan mesin.
-local VEND_STOCK, VEND_EMPTY = "Isi stock dari drop", "Kosongkan sampai habis"
-Vend.Fail = {} -- vending yang gagal diambil isinya: [x,y] = jumlah gagal
-
-function Vend.point()
-    local raw = tostring(Vend.Point or ""):gsub("%s", "")
-    local name, door = string.match(raw, "^([^:|]*)[:|](.+)$")
-    if not name then name = raw end
-    name = string.upper(name):gsub("[^A-Z0-9]", "")
-    if door == "" then door = nil end
-    return name, door
-end
-
--- Vending milikmu di world ini: { x, y, fg, id, stock, cap }
-function Vend.machines()
-    local w = Refs.World
-    local out = {}
-    if not w then return out end
-    local vends = rawget(w, "vends")
-    local owner = rawget(w, "vendOwner")
-    for y = 0, w.h - 1 do
-        local row = w.fg[y]
-        if row then
-            for x = 0, w.w - 1 do
-                local id = row[x] or 0
-                local it = id ~= 0 and ItemDB[id]
-                if it and it.vend then
-                    local okO, mine = true, true
-                    if type(owner) == "function" then okO, mine = pcall(owner, x, y) end
-                    if okO and mine then
-                        local d = nil
-                        if type(vends) == "table" and type(vends.get) == "function" then
-                            local okD, v = pcall(vends.get, x, y)
-                            if okD and type(v) == "table" then d = v end
-                        end
-                        d = d or {}
-                        if not d.shop then
-                            out[#out + 1] = {
-                                x = x, y = y, fg = id, id = d.id, stock = tonumber(d.stock) or 0,
-                                cap = (id == 9268) and 10398 or 5199,
-                            }
-                        end
-                    end
-                end
-            end
-        end
-    end
-    return out
-end
-
--- Item ini boleh diproses? (pilihan jenis + daftar item; tool & lock tidak pernah)
--- Bisa masuk vending? (gems, tool, lock, item tidak bisa ditrade, mesin vending: tidak)
-function Vend.sellable(id)
-    if type(id) ~= "number" or id == 112 then return false end
-    local it = ItemDB[id]
-    if not it or it.kind == "tool" then return false end
-    if it.lock or it.area or it.guildLock or it.untradeable or it.vend or it.hub then return false end
-    local nm = tostring(it.name or ""):lower()
-    if nm == "gems" or nm == "gem" then return false end
-    return true
-end
-
-function Vend.allow(id)
-    if not Vend.sellable(id) then return false end
-    if #Vend.Items > 0 and not table.find(Vend.Items, id) then return false end
-    return true
-end
-
-function Vend.filtered()
-    return #Vend.Items > 0
-end
-
--- Pilihan item untuk dropdown: item di vending, di tas, drop yang pernah terlihat, dan yang sudah dipilih
-function Vend.labels(machines)
-    local seen = Vend.Seen
-    local st = { inv = 0, drop = 0, vend = 0 }
-    for _, m in ipairs(machines or {}) do
-        if m.id then
-            seen[m.id] = true
-            st.vend += 1
-        end
-    end
-    -- isi tas: baca slot inventori (sama seperti dropdown block / seed)
-    if Refs.Inv then
-        local okS, slots = pcall(function() return Refs.Inv.slots end)
-        if okS and type(slots) == "table" then
-            for _, slot in pairs(slots) do
-                local id = type(slot) == "table" and tonumber(slot.id) or nil
-                if id and (tonumber(slot.n) or 1) > 0 then
-                    seen[id] = true
-                    st.inv += 1
-                end
-            end
-        end
-    end
-    -- drop di world ini
-    local list = Drops.list
-    if type(list) == "table" then
-        local n, ids = 0, {}
-        for _, d in pairs(list) do
-            n += 1
-            if n > 600 then break end
-            local id = type(d) == "table" and tonumber(d.id) or nil
-            if id and not ids[id] then
-                ids[id] = true
-                seen[id] = true
-                st.drop += 1
-            end
-        end
-    end
-    for _, id in ipairs(Vend.Items) do seen[id] = true end
-    local ids = {}
-    for id in pairs(seen) do
-        if Vend.sellable(id) then ids[#ids + 1] = id end
-    end
-    table.sort(ids)
-    local labels, picked = {}, {}
-    for _, id in ipairs(ids) do
-        local label = ("%s [%d]"):format(tostring(itemName(id)), id)
-        labels[#labels + 1] = label
-        if table.find(Vend.Items, id) then picked[#picked + 1] = label end
-    end
-    return labels, picked, st
-end
-
-function Vend.call(...)
-    local w = Refs.World
-    local f = w and rawget(w, "vendCall")
-    if type(f) ~= "function" then return false end
-    local ok, res = pcall(f, ...)
-    return ok and res == true
-end
-
--- Berdiri di depan vending (aturan game: <= 0.85 tile mendatar, sebaris)
-function Vend.goTo(m)
-    local function near(c)
-        return c ~= nil and math.abs(c.x - (m.x + 0.5)) <= 0.84 and math.abs((c.y - 0.5) - (m.y + 0.5)) <= 0.58
-    end
-    if near(playerState()) then return true end
-    if walkTo(m.x, m.y, 40) and near(playerState()) then return true end
-    for _, dx in ipairs({ -1, 1 }) do
-        if walkTo(m.x + dx, m.y, 30) then
-            local t0 = os.clock()
-            AutoInput.active = true
-            while alive() and os.clock() - t0 < 1 do
-                task.wait()
-                local c = playerState()
-                if not c then break end
-                steerX(c, m.x + 0.5 + dx * 0.55, 0.06)
-                if near(c) and c.grounded then break end
-            end
-            releaseInput()
-            if near(playerState()) then return true end
-        end
-    end
-    return false
-end
-
-function Vend.sortNear(list)
-    local s = playerState()
-    if not s then return list end
-    table.sort(list, function(a, b)
-        local da = math.abs(a.x + 0.5 - s.x) + 2 * math.abs(a.y + 1 - s.y)
-        local db = math.abs(b.x + 0.5 - s.x) + 2 * math.abs(b.y + 1 - s.y)
-        return da < db
-    end)
-    return list
-end
-
--- Tambah stock HANYA dari item hasil pungut (Vend.Picked = jumlahnya), bukan barang lain di tas.
--- Item hasil pungut yang belum punya vending -> vending kosong.
-function Vend.stockAll(live)
-    local list = Vend.sortNear(Vend.machines())
-    local selling = {}
-    for _, m in ipairs(list) do
-        if m.id and m.stock > 0 then selling[m.id] = true end
-    end
-    local done, tried = 0, 0
-    for _, m in ipairs(list) do
-        if not live() then break end
-        local id = (m.id and m.stock > 0) and m.id or nil
-        if id and not Vend.allow(id) then id = nil end
-        local n = 0
-        if id then
-            -- vending yang sudah menjual item ini: semua isi tas ikut di-stock
-            n = math.min(invCount(id), m.cap - m.stock)
-        elseif not (m.id and m.stock > 0) then
-            -- vending kosong: item pilihan yang ada di tas, atau (tanpa pilihan) item hasil pungut
-            local cands = {}
-            if #Vend.Items > 0 then
-                for _, pid in ipairs(Vend.Items) do cands[#cands + 1] = pid end
-            else
-                for pid, cnt in pairs(Vend.Picked) do
-                    if cnt > 0 then cands[#cands + 1] = pid end
-                end
-                table.sort(cands)
-            end
-            for _, pid in ipairs(cands) do
-                if not selling[pid] and Vend.allow(pid) and invCount(pid) > 0 then
-                    id = pid
-                    break
-                end
-            end
-            if id then
-                n = math.min(invCount(id), m.cap)
-                if #Vend.Items == 0 then n = math.min(n, Vend.Picked[id] or 0) end
-            end
-        end
-        if id and n > 0 then
-            tried += 1
-            Vend.Status = ("Ke vending (%d,%d): tambah %s x%d"):format(m.x, m.y, itemName(id), n)
-            if Vend.goTo(m) then
-                if Vend.call("stock", m.x, m.y, id, n) then
-                    selling[id] = true
-                    if Vend.Picked[id] then
-                        Vend.Picked[id] -= n
-                        if Vend.Picked[id] <= 0 then Vend.Picked[id] = nil end
-                    end
-                    Vend.Stocked += n
-                    done += n
-                    Vend.Status = ("Stock %s +%d di (%d,%d)"):format(itemName(id), n, m.x, m.y)
-                    task.wait(0.3)
-                else
-                    Vend.Status = ("Gagal tambah stock di (%d,%d)"):format(m.x, m.y)
-                    task.wait(0.5)
-                end
-            else
-                Vend.Status = ("Tidak bisa ke vending (%d,%d)"):format(m.x, m.y)
-            end
-        end
-    end
-    return done, tried
-end
-
--- Item yang dicari untuk diisi: yang dijual vending & belum penuh.
--- Vending kosong: boleh diisi item baru (maksimal sejumlah vending kosong, item yang vendingnya penuh tidak diambil).
-function Vend.wanted()
-    local want, sold, empty = {}, {}, 0
-    for _, m in ipairs(Vend.machines()) do
-        if m.id and m.stock > 0 then
-            sold[m.id] = true
-            if m.stock < m.cap and Vend.allow(m.id) then want[m.id] = true end
-        else
-            empty += 1
-        end
-    end
-    return want, empty, sold
-end
-
--- Pindah world (lewat menu game); world sama & tanpa pintu = tidak pindah
-function Vend.travel(name, door)
-    if name == Guard.worldName() and not door then return true end
-    local ok, err = goWorld(name, door)
-    if ok then
-        -- tunggu karakter muncul di world tujuan (bukan jeda tetap)
-        local t0 = os.clock()
-        while os.clock() - t0 < 4 and not (playerState() and Guard.worldName() == name) do task.wait(0.1) end
-        task.wait(0.2)
-    end
-    return ok, err
-end
-
--- Pungut drop item yang dicari di world ini (sentuhan badan, per baris). Hasil: jumlah item terambil.
-function Vend.pickHere(live, want, empty, sold)
-    local before = {} -- jumlah di tas sebelum item itu dipungut (dicatat saat drop-nya pertama dilihat)
-    local newIds = 0
-    for id, cnt in pairs(Vend.Picked) do
-        if not sold[id] and cnt > 0 and invCount(id) > 0 then newIds += 1 end
-    end
-    local function wantId(d)
-        if not Vend.allow(d.id) then return false end
-        if not want[d.id] then
-            if sold[d.id] or empty <= 0 then return false end -- vending item ini penuh / tidak ada vending kosong
-            if before[d.id] == nil and not (Vend.Picked[d.id] and invCount(d.id) > 0) then
-                if newIds >= empty then return false end -- vending kosong sudah "dipesan" item lain
-                newIds += 1
-            end
-        end
-        if before[d.id] == nil then before[d.id] = invCount(d.id) end
-        return true
-    end
-    Move.NoZone = true -- drop yang di-drop Pabrik di titik drop boleh diambil
-    Move.fetchDrops(live, 999, wantId, 240)
-    Move.NoZone = false
-    local got = 0
-    for id, n in pairs(before) do
-        local diff = invCount(id) - n
-        if diff > 0 then
-            got += diff
-            Vend.Picked[id] = (Vend.Picked[id] or 0) + diff
-        end
-    end
-    return got
-end
-
--- Drop semua hasil kosongkan vending di titik drop vending, lalu pulang
-function Vend.dropTrip(live, home)
-    local name, door = Vend.point()
-    if name == "" then name = home end
-    local items = {}
-    for id, cnt in pairs(Vend.Carry) do -- hanya jumlah yang diambil dari vending (barang lain di tas tidak ikut)
-        local n = math.min(cnt, invCount(id))
-        if n > 0 then items[#items + 1] = { id = id, n = n } end
-    end
-    if #items == 0 then return true end
-    Vend.Status = "Pergi ke titik drop " .. name .. (door and (":" .. door) or "")
-    local ok, err = Vend.travel(name, door)
-    if not ok then
-        Vend.Status = "Gagal ke titik drop: " .. tostring(err)
-        return false
-    end
-    if not Vend.goSpot(live) then return false end
-    for _, it in ipairs(items) do
-        if not live() then break end
-        local got, derr = dropItems(it.id, it.n, live)
-        Vend.Dropped += got
-        if got > 0 then
-            local msg = ("Drop %s x%d di %s"):format(itemName(it.id), got, Guard.worldName())
-            Vend.Status = msg
-            Hook.send("pabrik", "Vending: " .. msg)
-        end
-        if derr then Vend.Status = "Drop: " .. tostring(derr) end
-    end
-    if Guard.worldName() ~= home and live() then
-        Vend.Status = "Pulang ke " .. home
-        local okh = Vend.travel(home, nil)
-        if not okh and live() then
-            task.wait(5)
-            okh = Vend.travel(home, nil)
-        end
-        if not okh then return false, "home" end
-    end
-    return true
-end
-
--- Jalan ke posisi drop vending yang disimpan (kalau diatur)
-function Vend.goSpot(live)
-    if Vend.DropX < 0 or not live() then return true end
-    local s = playerState()
-    if s then
-        local hx, hy = startNode(s)
-        if hx == Vend.DropX and hy == Vend.DropY then return true end
-    end
-    Vend.Status = ("Jalan ke posisi drop vending (%d,%d)"):format(Vend.DropX, Vend.DropY)
-    if walkTo(Vend.DropX, Vend.DropY, 60) then return true end
-    Vend.Status = ("Tidak bisa jalan ke posisi drop vending (%d,%d)"):format(Vend.DropX, Vend.DropY)
-    return false
-end
-
--- Drop yang kamu buang sendiri baru bisa dipungut setelah karakter menjauh (aturan game: armed).
--- Kalau berdiri di atas / dekat drop sendiri item yang dicari: geser 2-4 tile, tunggu sebentar.
-function Vend.stepAway(live)
-    local s = playerState()
-    local list = Drops.list
-    if not s or type(list) ~= "table" or not live() then return false end
-    local near = false
-    for _, d in pairs(list) do
-        if type(d) == "table" and d.armed == false and type(d.x) == "number" and type(d.y) == "number"
-            and Vend.allow(d.id) and math.abs(d.x - s.x) < 1.8 and math.abs(d.y - (s.y - 0.5)) < 1.8 then
-            near = true
-            break
-        end
-    end
-    if not near then return false end
-    local hx, hy = startNode(s)
-    for _, dx in ipairs({ 3, -3, 2, -2, 4, -4 }) do
-        if not live() then return false end
-        Vend.Status = "Menjauh dari drop sendiri supaya bisa dipungut"
-        if walkTo(hx + dx, hy, 8) then
-            Vend.sleep(0.6, live)
-            return true
-        end
-    end
-    return false
-end
-
--- Setelah pindah world: tunggu data world & vending termuat (maks 12 dtk). Hasil: daftar vending
-function Vend.waitWorld(home, live)
-    local t0 = os.clock()
-    local list = {}
-    while live() and os.clock() - t0 < 25 do
-        if Guard.worldName() == home and playerState() then
-            list = Vend.machines()
-            if #list > 0 then return list end
-        end
-        task.wait(0.5)
-    end
-    return list
-end
-
--- Titik drop diatur? (world lain / pintu / posisi XY)
-function Vend.hasPoint()
-    local name, door = Vend.point()
-    return name ~= "" or door ~= nil or Vend.DropX >= 0
-end
-
--- Gangguan sementara (ping tinggi, server telat, gagal pindah world): coba lagi dengan jeda
--- yang makin panjang. Baru berhenti setelah 8x gagal berturut-turut. Hasil: true = lanjut.
-function Vend.soft(reason, live)
-    Vend.Soft = (Vend.Soft or 0) + 1
-    if Vend.Soft > 8 then
-        Vend.stop(reason)
-        return false
-    end
-    Vend.Status = reason .. (" - coba lagi %d/8"):format(Vend.Soft)
-    Vend.sleep(math.min(2 + Vend.Soft * 2, 15), live)
-    return live()
-end
-
--- tunggu (bisa dihentikan)
-function Vend.sleep(sec, live)
-    local t0 = os.clock()
-    while live() and os.clock() - t0 < sec do task.wait(0.25) end
-end
-
-local function vendLoop(runId)
-    local function live() return Vend.Running and alive() and Vend.RunId == runId end
-    local home = Guard.worldName()
-    Vend.Home = home
-    Vend.Soft = 0
-    if #Vend.waitWorld(home, live) == 0 then
-        if live() then Vend.stop("Tidak ada vending milikmu di world ini (jalankan di world vending)") end
-        return
-    end
-    while live() do
-        task.wait()
-        if Vend.Mode == VEND_EMPTY then
-            -- ===== kosongkan =====
-            if Guard.worldName() ~= home then
-                if not Vend.travel(home, nil) then
-                    if not Vend.soft("Gagal pulang ke world vending " .. home, live) then break end
-                    continue
-                end
-            end
-            local hasPoint = Vend.hasPoint()
-            local list = {}
-            local all = Vend.waitWorld(home, live)
-            if #all == 0 and live() then
-                if not Vend.soft("Vending milikmu di " .. home .. " tidak terbaca", live) then break end
-                pcall(goWorld, home, nil) -- masuk ulang supaya data world termuat
-                continue
-            end
-            local skipped = {}
-            for _, m in ipairs(all) do
-                if m.id and m.stock > 0 then
-                    if not Vend.allow(m.id) then
-                        skipped[#skipped + 1] = itemName(m.id) .. " x" .. m.stock
-                    elseif (Vend.Fail[m.x .. "," .. m.y] or 0) < 4 then
-                        list[#list + 1] = m
-                    end
-                end
-            end
-            if #list == 0 and not Vend.Confirm then
-                -- cek sekali lagi sebentar lagi (data stock dari server bisa telat)
-                Vend.Confirm = true
-                Vend.Status = "Cek ulang isi vending..."
-                Vend.sleep(1.5, live)
-                continue
-            end
-            Vend.Confirm = false
-            if #list == 0 then
-                -- selesai: bawa sisa ke titik drop (kalau diatur)
-                if hasPoint and next(Vend.Carry) then
-                    local ok, why = Vend.dropTrip(live, home)
-                    if why == "home" or not ok then
-                        if not Vend.soft(why == "home" and ("Gagal pulang ke world vending " .. home)
-                            or ("Vending kosong, tapi drop gagal: " .. Vend.Status), live) then break end
-                        continue
-                    end
-                    Vend.Soft = 0
-                end
-                table.clear(Vend.Carry)
-                if next(Vend.Fail) then
-                    Vend.stop("Selesai, ada vending yang gagal diambil")
-                elseif #skipped > 0 then
-                    Vend.stop("Item terpilih sudah habis. Tidak diambil (bukan item terpilih): "
-                        .. table.concat(skipped, ", ", 1, math.min(#skipped, 4))
-                        .. ((#skipped > 4) and (" +" .. (#skipped - 4)) or "")
-                        .. ". Hapus pilihan item untuk ambil semua")
-                else
-                    Vend.stop("Semua vending sudah kosong")
-                end
-                break
-            end
-            local full = false
-            for _, m in ipairs(Vend.sortNear(list)) do
-                if not live() then break end
-                local room = 200
-                if Refs.Inv then
-                    local okr, r = pcall(function() return Refs.Inv:room(m.id) end)
-                    if okr and type(r) == "number" then room = r end
-                end
-                if room <= 0 then
-                    full = true
-                    break
-                end
-                Vend.Status = ("Ke vending (%d,%d): ambil %s"):format(m.x, m.y, itemName(m.id))
-                local key = m.x .. "," .. m.y
-                if Vend.goTo(m) then
-                    local before = invCount(m.id)
-                    local okc = Vend.call("empty", m.x, m.y)
-                    task.wait(0.4)
-                    local got = invCount(m.id) - before
-                    if got > 0 then
-                        Vend.Soft = 0
-                        Vend.Taken += got
-                        Vend.Carry[m.id] = (Vend.Carry[m.id] or 0) + got
-                        Vend.Fail[key] = nil
-                        Vend.Status = ("Ambil %s x%d dari (%d,%d)"):format(itemName(m.id), got, m.x, m.y)
-                        if got < m.stock then
-                            -- tas tidak muat semua: buang dulu ke titik drop, lalu ambil sisanya
-                            full = true
-                            break
-                        end
-                    else
-                        Vend.Fail[key] = (Vend.Fail[key] or 0) + 1
-                        if not okc and next(Vend.Carry) then
-                            full = true -- kemungkinan tas penuh: buang dulu ke titik drop
-                            break
-                        end
-                        Vend.sleep(1, live) -- server telat (ping): jeda sebelum coba lagi
-                    end
-                else
-                    Vend.Fail[key] = (Vend.Fail[key] or 0) + 1
-                    Vend.Status = ("Tidak bisa ke vending (%d,%d)"):format(m.x, m.y)
-                end
-            end
-            if not live() then break end
-            if full then
-                if not hasPoint then
-                    Vend.stop("Tas penuh: atur titik drop vending (WORLD / WORLD:ID / simpan posisi XY)")
-                    break
-                end
-                if not next(Vend.Carry) then
-                    Vend.stop("Tas penuh oleh item lain, kosongkan tas dulu")
-                    break
-                end
-                local ok, why = Vend.dropTrip(live, home)
-                if why == "home" or not ok then
-                    -- barang tetap dicatat, dicoba drop lagi di putaran berikutnya
-                    if not Vend.soft(why == "home" and ("Gagal pulang ke world vending " .. home)
-                        or ("Drop gagal: " .. Vend.Status), live) then break end
-                    continue
-                end
-                Vend.Soft = 0
-                table.clear(Vend.Carry)
-                table.clear(Vend.Fail)
-            end
-        else
-            -- ===== isi stock dari drop =====
-            if Guard.worldName() == home then
-                Vend.waitWorld(home, live)
-                local done, tried = Vend.stockAll(live)
-                if not live() then break end
-                if tried > 0 and done == 0 then
-                    if not Vend.soft("Tambah stock gagal: " .. Vend.Status, live) then break end
-                    continue
-                else
-                    if done > 0 then Vend.Soft = 0 end
-                end
-            end
-            local want, empty, sold = Vend.wanted()
-            if not next(want) and empty == 0 then
-                Vend.Status = Vend.filtered() and "Vending item terpilih penuh / belum ada yang menjual item terpilih"
-                    or "Semua vending penuh / belum ada vending yang menjual item"
-                Vend.sleep(4, live)
-                continue
-            end
-            local name, door = Vend.point()
-            if name == "" then name = home end
-            if Guard.worldName() ~= name or door then
-                if not (Guard.worldName() == name and Vend.AtPoint) then
-                    Vend.Status = "Pergi ke " .. name .. (door and (":" .. door) or "") .. " ambil drop"
-                    local ok, err = Vend.travel(name, door)
-                    if not ok then
-                        Vend.Status = "Gagal ke titik drop: " .. tostring(err)
-                        Vend.sleep(10, live)
-                        continue
-                    end
-                    Vend.AtPoint = true
-                end
-            end
-            Vend.goSpot(live)
-            -- tunggu di titik drop sampai ada yang bisa diambil (tidak bolak-balik world)
-            local got = 0
-            while live() do
-                Vend.stepAway(live)
-                got += Vend.pickHere(live, want, empty, sold)
-                local carry = false
-                for id in pairs(want) do
-                    if invCount(id) > 0 then
-                        carry = true
-                        break
-                    end
-                end
-                if not carry then
-                    for id, cnt in pairs(Vend.Picked) do
-                        if cnt > 0 and invCount(id) > 0 then
-                            carry = true
-                            break
-                        end
-                    end
-                end
-                if carry then break end
-                Vend.Status = "Menunggu drop baru di " .. Guard.worldName() .. "..."
-                Vend.sleep(0.5, live)
-            end
-            if not live() then break end
-            Vend.AtPoint = false
-            if Guard.worldName() ~= home then
-                Vend.Status = "Pulang ke " .. home .. " untuk isi stock"
-                local okh = Vend.travel(home, nil)
-                if not okh then
-                    if not Vend.soft("Gagal pulang ke world vending " .. home, live) then break end
-                    continue
-                end
-            end
-        end
-    end
-    releaseInput()
-end
-
-function Vend.stop(reason)
-    Vend.Running = false
-    Vend.AtPoint = false
-    Move.NoZone = false
-    autoEnd()
-    releaseInput()
-    Vend.Status = reason or "Dihentikan"
-    Vend.Confirm = false
-    if UI.VendToggle then UI.later("vendToggle", function() UI.VendToggle:Set(false) end) end
-    if reason then
-        notify("Vending", reason, 5)
-        if not string.find(reason, "^Dihentikan") then Hook.send("pabrik", "Vending: " .. reason) end
-    end
-end
-
-function Vend.start()
-    if Vend.Running then return end
-    local err
-    if not Refs.World then
-        err = "Data world belum ketemu. Tekan 'Hubungkan ke game'"
-    elseif not OrigIsDown then
-        err = "Kontrol gerak game (WorldMenu.isDown) tidak ketemu"
-    elseif not playerState() then
-        err = "Kamu belum masuk world"
-    elseif type(rawget(Refs.World, "vendCall")) ~= "function" then
-        err = "Fungsi vending game tidak ketemu"
-    end
-    if err then
-        notify("Vending", err, 4)
-        if UI.VendToggle then pcall(function() UI.VendToggle:Set(false) end) end
-        return
-    end
-    if State.Running and not State.Override then stopFarm("Dihentikan karena Vending dimulai") end
-    if Clear.Running then stopClear("Dihentikan karena Vending dimulai") end
-    if Farmer.Running then stopFarmer("Dihentikan karena Vending dimulai") end
-    if Splice.Running and Splice.stop then Splice.stop("Dihentikan karena Vending dimulai") end
-    if Pabrik.Running then Pabrik.stop("Dihentikan karena Vending dimulai") end
-    if Build.Running and Build.stop then Build.stop("Dihentikan karena Vending dimulai") end
-    table.clear(Vend.Carry)
-    table.clear(Vend.Picked)
-    table.clear(Vend.Fail)
-    table.clear(BadEdge)
-    Vend.FailRuns = 0
-    Vend.AtPoint = false
-    Vend.Running = true
-    Vend.RunId = (Vend.RunId or 0) + 1
-    Vend.Status = "Mulai..."
-    autoBegin()
-    if UI.VendToggle then pcall(function() UI.VendToggle:Set(true) end) end
-    local id = Vend.RunId
-    task.spawn(function()
-        local ok, e = pcall(vendLoop, id)
-        if not ok then
-            warn("[Zekio supreme] Vending error: " .. tostring(e))
-            if Vend.Running then Vend.stop("Error: " .. tostring(e)) end
-        end
-    end)
-end
-Auto.VEND_MODES = { VEND_STOCK, VEND_EMPTY }
-
----------------------------------------------------------------------
--- BANGUN LAHAN
----------------------------------------------------------------------
--- Cara kerja (sama seperti bikin farm manual di world baru yang penuh tanah):
---   1. GALI    : dari permukaan sampai bawah (tepat di atas bedrock), seperti ular.
---                Celah 1 tile di atas tiap baris digali (tempat pohon & jalan), ujung kiri
---                & kanan dibuka bergantian jadi tangga, background tanah ikut dipecah.
---                Tanah di baris lahan dibiarkan = sudah jadi lahan.
---   2. PASANG  : baris yang masih kosong (di atas permukaan) dipasang dari BAWAH ke atas.
---                Block pertama dipasang dari ujung tangga, lalu baris itu jadi jembatan:
---                berdiri di ujungnya, pasang block ke depan satu-satu, maju, sampai ujung.
---   3. PRODUKSI: block habis -> ambil dulu drop block sisa galian di lahan, lalu tanam 1 baris,
---                pasang-pecah block di KANAN karakter untuk dapat seed (seperti Pabrik),
---                collect, panen. Sampai 190 block -> lanjut pasang, sisakan 10 block.
---   4. BERSIH  : semua drop yang tertinggal di lahan dicari (scan) lalu didatangi pakai A*.
-local BuildFail = {}
-
-local function overlapsPlayer(x, y, s)
-    return x + 1 > s.x - 0.3 and x < s.x + 0.3 and y + 1 > s.y - 0.95 and y < s.y
-end
-
-local function placeBuild(t, s)
-    local id = Build.BlockId
-    if invCount(id) <= (Build.Reserve or 0) or overlapsPlayer(t.x, t.y, s) then return false end
-    if not placeOk(t.x, t.y) then
-        skipTile(Build.Skip, t.idx, 120)
-        return false
-    end
-    sendSetTile("fg", t.x, t.y, id)
-    pcall(function() Refs.Inv:remove(id, 1) end)
-    Build.Placed += 1
-    Build.Status = ("Pasang %s (%d,%d)"):format(itemName(id), t.x, t.y)
-    return true
-end
-
--- Rencana lahan: baris, kolom block & lubang tangga tiap baris
-function Build.plan()
-    local w = Refs.World
-    if not w then return nil end
-    local rows = landRows()
-    if #rows == 0 then return nil end
-    local W = w.w
-    local P = {
-        rows = rows, K = #rows, W = W,
-        x0 = math.clamp(math.floor(math.min(Land.X0, Land.X1)), 0, W - 1),
-        x1 = math.clamp(math.floor(math.max(Land.X0, Land.X1)), 0, W - 1),
-        cols = {}, isLand = {}, holes = {},
-    }
-    for k = 1, #rows do
-        local cols = landCols(k - 1)
-        local set = {}
-        for _, x in ipairs(cols) do set[x] = true end
-        local holes = {}
-        for x = P.x0, P.x1 do
-            if not set[x] then holes[#holes + 1] = x end
-        end
-        P.cols[k], P.isLand[k], P.holes[k] = cols, set, holes
-    end
-    return P
-end
-
--- Permukaan tanah asli: baris pertama yang dia & baris bawahnya sebagian besar padat
-function Build.findSurface(P)
-    local w = Refs.World
-    local span = P.x1 - P.x0 + 1
-    local function full(y)
-        local n = 0
-        for x = P.x0, P.x1 do
-            local it = ItemDB[fgIdAt(x, y)]
-            if it and it.solid and it.kind ~= "seed" then n += 1 end
-        end
-        return n * 2 > span
-    end
-    for y = math.max(0, P.rows[1] - 1), w.h - 2 do
-        if full(y) and full(y + 1) then return y end
-    end
-    return math.huge
-end
-
--- Yang masih harus digali di tile ini: "fg" (tanah / batu / lava), "bg" (background tanah), nil = beres.
--- Pohon & benda tidak padat dibiarkan.
-function Build.carveLayer(x, y, W)
-    local fg = fgIdAt(x, y)
-    if fg ~= 0 then
-        local it = ItemDB[fg]
-        if it and it.kind ~= "seed" and (it.solid or it.deadly or it.hurts) and canBreak(fg) then return "fg" end
-        return nil
-    end
-    if y >= (Build.Surface or math.huge) or Build.Carved[y * W + x] then
-        local bg = tileAt("bg", x, y)
-        if bg and bg ~= 0 and canBreak(bg) then return "bg" end
-    end
-    return nil
-end
-
--- Urutan gali seperti ular, dari atas ke bawah (hanya tile yang masih perlu digali):
---   celah baris ke-1 kiri -> kanan, turun lewat lubang ujung kanan,
---   celah baris ke-2 kanan -> kiri, turun lewat lubang ujung kiri, dst.
---   Lubang di ujung awal dibuka dari celah di bawahnya (supaya tidak terperosok).
---   Lantai lahan di dalam tanah yang bolong (gua) / lava ditambal block sambil lewat.
-function Build.carveList(P)
-    local W, list = P.W, {}
-    local function add(x, y, kind)
-        if y >= 0 and Build.carveLayer(x, y, W) then
-            list[#list + 1] = { x = x, y = y, idx = y * W + x, kind = kind }
-        end
-    end
-    local surf = Build.Surface or math.huge
-    local canFill = Build.BlockId ~= nil and invCount(Build.BlockId) > 0
-    local function fill(x, y)
-        if y < surf then return end
-        local id = fgIdAt(x, y)
-        local need = false
-        if id == 0 then
-            need = canFill
-        elseif not Build.done(x, y) then
-            local it = ItemDB[id]
-            need = it ~= nil and it.kind ~= "seed" and (it.deadly or it.hurts) and canBreak(id) and true or false
-        end
-        if need then list[#list + 1] = { x = x, y = y, idx = y * W + x, kind = "fill" } end
-    end
-    for k = 1, P.K do
-        local y = P.rows[k]
-        local d = ((k - 1) % 2 == 0) and 1 or -1
-        local up = nil -- lubang ujung awal baris di atasnya, dibuka dari celah ini
-        if k > 1 and #P.holes[k - 1] > 0 then
-            local ph = P.holes[k - 1]
-            up = (d == -1) and ph[1] or ph[#ph]
-        end
-        local a, b = P.x0, P.x1
-        if d == -1 then a, b = P.x1, P.x0 end
-        local L = P.isLand[k]
-        for x = a, b, d do
-            if L[x] then fill(x, y) end -- lantai dulu, baru celah di atasnya
-            add(x, y - 1, "gap")
-            if x == up then add(x, P.rows[k - 1], "hole") end
-        end
-        -- lubang ujung akhir baris ini = jalan turun ke celah baris bawahnya
-        if k < P.K and #P.holes[k] > 0 then
-            local h = P.holes[k]
-            add((d == 1) and h[#h] or h[1], y, "hole")
-        end
-    end
-    return list
-end
-
--- Jalan (A*) ke tempat yang menjangkau salah satu target.
--- maxY = tempat berdiri tidak boleh lebih bawah dari ini, noSelf = jangan berdiri di tile target.
--- Hasil: "move" | "nopath" | "wait"
-function Build.goNear(targets, R, maxY, noSelf)
-    local w = Refs.World
-    local s = playerState()
-    if not w or not s then return "wait" end
-    local sx, sy = startNode(s)
-    local goals = { maxY = maxY, noSelf = noSelf }
-    for _, t in ipairs(targets) do goals[t.idx] = true end
-    local f = targets[1]
-    setMoveStatus(("Cari jalan A* ke (%d,%d)"):format(f.x, f.y))
-    local path = astar(sx, sy, goals, f.x, f.y, R, false)
-    if not path then
-        releaseInput()
-        return "nopath"
-    end
-    local fails = BuildFail[f.idx] or 0
-    if #path == 0 then
-        execWalk(sx, sy) -- sudah di tempat tapi belum terjangkau: rapikan ke tengah tile
-        fails += 1
-    elseif not followPath(path) then
-        fails += 1
-    else
-        fails = 0
-    end
-    releaseInput()
-    if fails >= 4 then
-        fails = 0
-        for _, t in ipairs(targets) do skipTile(Build.Skip, t.idx, 30) end
-    end
-    BuildFail[f.idx] = (fails > 0) and fails or nil
-    return "move"
-end
-
--- Pukul 1 tile sampai bersih (block dulu, lalu background).
--- Hasil: "done" | "fall" (karakter jatuh) | "skip" | "stop"
-function Build.carveTile(t, live)
-    local hits, maxHits = 0, nil
-    while live() and alive() do
-        local layer = Build.carveLayer(t.x, t.y, Refs.World.w)
-        if not layer then return "done" end
-        local id = (layer == "fg") and fgIdAt(t.x, t.y) or (tileAt("bg", t.x, t.y) or 0)
-        maxHits = maxHits or (hitsNeeded(id) * 3 + 6)
-        local r = tryBreak(t.x, t.y, layer == "bg")
-        if r == nil then
-            skipTile(Build.Skip, t.idx, 60)
-            return "skip"
-        end
-        if r == "broke" then
-            if layer == "fg" then Build.Carved[t.idx] = true end
-            Build.Dug += 1
-            Build.Status = ("Gali %s (%d,%d)"):format(itemName(id), t.x, t.y)
-            local bt = (Build.BreakTimes[t.idx] or 0) + 1
-            Build.BreakTimes[t.idx] = bt
-            if bt > 8 then -- server terus mengembalikan tile ini
-                skipTile(Build.Skip, t.idx, 120)
-                return "skip"
-            end
-            hits, maxHits = 0, nil
-            local s = playerState()
-            if not s or not s.grounded then
-                waitAuto(State.BreakMs)
-                return "fall"
-            end
-        else
-            hits += 1
-            Build.Status = ("Pukul %s (%d,%d)"):format(itemName(id), t.x, t.y)
-            if hits > maxHits then
-                skipTile(Build.Skip, t.idx, 45)
-                return "skip"
-            end
-        end
-        if not waitAuto(State.BreakMs) then return "stop" end
-    end
-    return "stop"
-end
-
--- Lantai lahan bolong / lava: pecah dulu kalau perlu, lalu pasang block.
--- Hasil: "done" | "fall" | "skip" | "stop"
-function Build.fillTile(t)
-    local id = fgIdAt(t.x, t.y)
-    if id ~= 0 and not Build.done(t.x, t.y) then
-        Build.Status = ("Pecah %s di lantai (%d,%d)"):format(itemName(id), t.x, t.y)
-        for _ = 1, 40 do
-            local r = tryBreak(t.x, t.y, false)
-            if r == nil then
-                skipTile(Build.Skip, t.idx, 60)
-                return "skip"
-            end
-            if r == "broke" then break end
-            if not waitAuto(State.BreakMs) then return "stop" end
-        end
-        local cur = playerState()
-        if not cur or not cur.grounded then return "fall" end
-    end
-    if fgIdAt(t.x, t.y) == 0 then
-        local cur = playerState()
-        if not cur or invCount(Build.BlockId) <= 0 or not placeBuild(t, cur) then
-            skipTile(Build.Skip, t.idx, 30)
-            return "skip"
-        end
-        Build.Status = ("Tambal lantai lahan (%d,%d)"):format(t.x, t.y)
-        if not waitAuto(State.PlaceMs) then return "stop" end
-    end
-    return "done"
-end
-
--- 1 langkah gali. Hasil: "work" | "move" | "wait" | "none"
-function Build.carveStep(P, list, live)
-    local w = Refs.World
-    local s = playerState()
-    if not w or not s or s.dead then
-        releaseInput()
-        task.wait(0.5)
-        return "wait"
-    end
-    if not s.grounded then
-        releaseInput()
-        Move.airCheck(s)
-        task.wait()
-        return "wait"
-    end
-    Move.AirAt = nil
-    releaseInput()
-    local R = punchReach() - 0.08
-    local now = os.clock()
-    local fi = nil
-    for i, t in ipairs(list) do
-        if not skipped(Build.Skip, t.idx, now) then
-            fi = i
-            break
-        end
-    end
-    if not fi then return "none" end
-    -- pecah yang terjangkau dari sini sesuai urutan (berhenti di tile pertama yang tidak terjangkau)
-    local did = 0
-    for j = fi, math.min(#list, fi + 5) do
-        local t = list[j]
-        if not skipped(Build.Skip, t.idx, now) then
-            local cur = playerState()
-            if not cur or cur.dead or not cur.grounded or not stateReaches(cur, t.x, t.y, R) then break end
-            if t.kind == "fill" and overlapsPlayer(t.x, t.y, cur) then break end -- berdiri di lubangnya: pindah dulu
-            if not canWorkAt(t.x, t.y) then
-                skipTile(Build.Skip, t.idx, 300) -- dikunci orang lain
-            elseif t.kind == "fill" then
-                did += 1
-                if Build.fillTile(t) ~= "done" then break end
-            else
-                -- block pijakan sendiri: pecah hanya kalau jatuhnya pendek & aman
-                local foot = floor(cur.y + 0.01)
-                if t.y == foot and t.x >= floor(cur.x - 0.3) and t.x <= floor(cur.x + 0.3 - 0.0001) then
-                    local d = fallAfterBreak(cur, t.x, foot)
-                    if d == nil or d > 3 then
-                        skipTile(Build.Skip, t.idx, 20)
-                        break
-                    end
-                end
-                did += 1
-                if Build.carveTile(t, live) ~= "done" then break end
-            end
-        end
-    end
-    if did > 0 then return "work" end
-    local F = list[fi]
-    local r = Build.goNear({ F }, math.min(punchReach(), buildReach()) - 0.35, nil, F.kind == "fill")
-    if r == "nopath" then
-        -- belum ada jalan ke sini: lewati sebaris dulu (tidak cari jalan berulang per tile)
-        for _, t in ipairs(list) do
-            if t.y == F.y then skipTile(Build.Skip, t.idx, 30) end
-        end
-        return "move"
-    end
-    return r
-end
-
--- Tile masuk baris: block di samping lubang tangga (block pertama baris dipasang dari sini)
-function Build.entries(P, k)
-    local e = {}
-    local holes, L = P.holes[k], P.isLand[k]
-    if #holes == 0 then
-        e[P.x0], e[P.x1] = true, true
-    else
-        for _, h in ipairs(holes) do
-            if L[h - 1] and L[h - 2] then e[h - 1] = true end
-            if L[h + 1] and L[h + 2] then e[h + 1] = true end
-        end
-    end
-    return e
-end
-
--- 1 langkah pasang: baris paling BAWAH yang belum lengkap dulu, naik ke atas.
--- Baris yang sedang dipasang jadi jembatan: berdiri di atasnya lalu pasang ke depan.
--- Hasil: "work" | "move" | "wait" | "none"
-function Build.placeStep(P)
-    local w = Refs.World
-    local s = playerState()
-    if not w or not s or s.dead then
-        releaseInput()
-        task.wait(0.5)
-        return "wait"
-    end
-    if not s.grounded then
-        releaseInput()
-        Move.airCheck(s)
-        task.wait()
-        return "wait"
-    end
-    Move.AirAt = nil
-    releaseInput()
-    local W = P.W
-    local R = buildReach() - 0.08
-    local now = os.clock()
-    local k, T = nil, nil
-    for kk = P.K, 1, -1 do
-        local y = P.rows[kk]
-        local list = {}
-        for _, x in ipairs(P.cols[kk]) do
-            local idx = y * W + x
-            if not Build.done(x, y) and not skipped(Build.Skip, idx, now) then
-                list[#list + 1] = { x = x, y = y, idx = idx }
-            end
-        end
-        if #list > 0 then
-            k, T = kk, list
-            break
-        end
-    end
-    if not k then return "none" end
-    local y = P.rows[k]
-    local px = s.x
-    table.sort(T, function(a, b) return abs(a.x + 0.5 - px) < abs(b.x + 0.5 - px) end)
-    local _, sy = startNode(s)
-    local onRow = sy <= y - 1 -- berdiri di atas baris ini (jembatan)
-    local under = Build.Under[k] ~= nil and now < Build.Under[k]
-    local entry = Build.entries(P, k)
-    local hasAny = false
-    for _, x in ipairs(P.cols[k]) do
-        if Build.done(x, y) then
-            hasAny = true
-            break
-        end
-    end
-
-    -- pasang yang terjangkau, yang paling dekat dulu (maks 2 per langkah)
-    local done = 0
-    for _, t in ipairs(T) do
-        if done >= 2 then break end
-        local cur = playerState()
-        if not cur or not cur.grounded then break end
-        if stateReaches(cur, t.x, t.y, R) and (onRow or under or entry[t.x]) then
-            if fgIdAt(t.x, t.y) ~= 0 then
-                -- tile lahan berisi pohon / lava / hiasan: pecah dulu
-                if not canWorkAt(t.x, t.y) then
-                    skipTile(Build.Skip, t.idx, 300)
-                else
-                    Build.Status = ("Bersihkan tile lahan (%d,%d)"):format(t.x, t.y)
-                    local broke = false
-                    for _ = 1, 40 do
-                        local r = tryBreak(t.x, t.y, false)
-                        if r == nil then break end -- tidak bisa dipecah (lock, pintu, dll)
-                        if r == "broke" then
-                            broke = true
-                            break
-                        end
-                        if not waitAuto(State.BreakMs) then return "wait" end
-                    end
-                    -- tidak bisa dibersihkan: jangan didatangi ulang terus (bikin bolak-balik jauh)
-                    if not broke then skipTile(Build.Skip, t.idx, 1800) end
-                    waitNearDrops(0.5)
-                end
-                return "work"
-            end
-            if placeBuild(t, cur) then
-                done += 1
-                if entry[t.x] then Build.Under[k] = nil end
-                if not waitAuto(State.PlaceMs) then return "wait" end
-            elseif invCount(Build.BlockId) <= (Build.Reserve or 0) then
-                break
-            end
-        end
-    end
-    if done > 0 then return "work" end
-    if invCount(Build.BlockId) <= (Build.Reserve or 0) then return "none" end
-
-    local RR = buildReach() - 0.35
-    -- naik ke baris ini lalu pasang ke depan (baris jadi jembatan)
-    if hasAny and not under then
-        local r = Build.goNear(T, RR, y - 1, true)
-        if r ~= "nopath" then return r end
-        Build.Under[k] = now + 60 -- tidak bisa naik ke baris ini: sementara pasang dari bawah
-        under = true
-    end
-    -- belum ada pijakan: ke ujung tangga, pasang block pertama baris dari sana
-    if not under then
-        local E = {}
-        for _, t in ipairs(T) do
-            if entry[t.x] then E[#E + 1] = t end
-        end
-        if #E > 0 then
-            local r = Build.goNear(E, RR, nil, true)
-            if r ~= "nopath" then return r end
-        end
-        Build.Under[k] = now + 60
-    end
-    local r = Build.goNear(T, RR, nil, true)
-    if r == "nopath" then
-        for _, t in ipairs(T) do skipTile(Build.Skip, t.idx, 30) end
-        Build.Status = ("Baris y %d belum terjangkau, dilewati sebentar"):format(y)
-        return "none"
-    end
-    return r
-end
-
--- ---------- Produksi block (1 baris, seperti Pabrik) ----------
-function Build.cfg(o, harvest, plant)
-    return {
-        run = o.live,
-        harvest = harvest,
-        plant = plant and invCount(o.seed) > 0,
-        seed = o.seed,
-        only = o.seed,           -- hanya panen pohon seed block ini
-        skip = Build.FieldSkip,
-        hms = Farmer.HarvestMs,
-        pms = Farmer.PlantMs,
-        area = inLandRect,       -- hanya pohon di lahan (baris per baris)
-        plantSet = o.plantSet,   -- tanam hanya di baris produksi
-        exclude = o.exclude,
-        row = Build.Row,
-        collect = true,
-        status = function(t) Build.Status = t end,
-        onHarvest = function() Build.Harvested += 1 end,
-        onPlant = function() Build.Planted += 1 end,
-    }
-end
-
--- Baris produksi: baris lengkap tepat di bawah baris yang sedang dipasang
--- (kalau tidak ada: baris lengkap terdekat dengan karakter)
-function Build.prodRow(P)
-    local function complete(k)
-        local y = P.rows[k]
-        for _, x in ipairs(P.cols[k]) do
-            if not Build.done(x, y) then return false end
-        end
-        return true
-    end
-    for k = P.K, 1, -1 do
-        if not complete(k) then
-            if k < P.K then return k + 1 end
-            break
-        end
-    end
-    local s = playerState()
-    local best, bd = nil, nil
-    for k = 1, P.K do
-        if complete(k) then
-            local d = s and abs(P.rows[k] - s.y) or k
-            if not bd or d < bd then best, bd = k, d end
-        end
-    end
-    return best
-end
-
--- Tempat tanam baris produksi + posisi pasang-pecah.
--- Posisi break & grid lahan diatur (tab Lahan / Grid mode Lahan): pakai itu.
--- Belum diatur: otomatis berdiri dekat ujung kanan baris, block di KANAN karakter.
-function Build.prodSpots(P, k)
-    local W, y = P.W, P.rows[k]
-    local gy = y - 1
-    local o = { set = {} }
-    local L = P.isLand[k]
-    local skip = {}
-    if Build.BreakX >= 0 and next(Build.Tiles) ~= nil then
-        skip[Build.BreakY * W + Build.BreakX] = true -- jangan tanam di tempat berdiri & tile break
-        for key in pairs(Build.Tiles) do
-            local dx, dy = string.match(key, "^(-?%d+),(-?%d+)$")
-            if dx then skip[(Build.BreakY + tonumber(dy)) * W + Build.BreakX + tonumber(dx)] = true end
-        end
-    else
-        local bx = P.x1 - 3
-        if gy >= 0 and bx > P.x0 and L[bx] and L[bx + 1] and Build.done(bx, y) and Build.done(bx + 1, y) then
-            o.stand = { x = bx, y = gy }
-            o.tile = { x = bx + 1, y = gy }
-            skip[gy * W + bx], skip[gy * W + bx + 1] = true, true
-        end
-    end
-    if gy >= 0 then
-        for _, x in ipairs(P.cols[k]) do
-            local idx = gy * W + x
-            if not skip[idx] then o.set[idx] = true end
-        end
-    end
-    return o
-end
-
--- Sesi break produksi di posisi & grid lahan (mesin Auto Farm: multi tile, sentuh drop tiap putaran).
--- Berhenti kalau seed sudah cukup untuk mengisi baris, block habis, atau 8 dtk tidak ada aksi.
-function Build.breakSession(o)
-    local s = playerState()
-    if not s then return false end
-    local hx, hy = startNode(s)
-    if hx ~= Build.BreakX or hy ~= Build.BreakY then
-        Build.Status = ("Jalan ke posisi break lahan (%d,%d)"):format(Build.BreakX, Build.BreakY)
-        if not walkTo(Build.BreakX, Build.BreakY, 45) then
-            Build.Status = "Gagal jalan ke posisi break lahan, pakai posisi otomatis"
-            return nil
-        end
-    end
-    if not o.live() then return false end
-    local before = invCount(o.seed)
-    local want = math.max(1, Build.freeSpots(o))
-    State.Override = { offsets = Build.Tiles, block = o.block, mode = "Place + Break" }
-    State.Quiet = true
-    table.clear(HitCount)
-    table.clear(PlacedAt)
-    State.Running = true
-    State.RunId = (State.RunId or 0) + 1
-    local id = State.RunId
-    local lastActs, lastActAt = State.Placed + State.Broken, os.clock()
-    task.spawn(function() -- pengawas sesi break
-        while State.Running and State.RunId == id do
-            task.wait(0.5)
-            local acts = State.Placed + State.Broken
-            if acts ~= lastActs then lastActs, lastActAt = acts, os.clock() end
-            if not o.live() or invCount(o.seed) >= before + want or invCount(o.block) <= 0
-                or os.clock() - lastActAt > 8 then
-                State.Running = false
-            end
-        end
-    end)
-    Build.Status = ("Break %s di posisi break lahan (%d,%d)"):format(itemName(o.block), Build.BreakX, Build.BreakY)
-    local ok, e = pcall(farmLoop, id)
-    if not ok then warn("[Zekio supreme] Break lahan error: " .. tostring(e)) end
-    State.Running = false
-    State.Override = nil
-    State.Quiet = false
-    return invCount(o.seed) > before
-end
-
--- Tempat tanam yang masih kosong di baris produksi
-function Build.freeSpots(o)
-    local w = Refs.World
-    if not w then return 0 end
-    if not o.plantSet then
-        local n, nxt = readyTreeCount(true, o.seed)
-        return (n == 0 and nxt == nil) and 1 or 0
-    end
-    local n = 0
-    for idx in pairs(o.plantSet) do
-        local x, y = idx % w.w, idx // w.w
-        if fgIdAt(x, y) == 0 and plantSpotOk(x, y, o.seed) then n += 1 end
-    end
-    return n
-end
-
--- Pasang lalu pecah block di KANAN karakter untuk dapat seed (seperti Pabrik)
-function Build.bootstrap(o)
-    local w = Refs.World
-    if not w or invCount(o.block) <= 0 then return false end
-    if Build.BreakX >= 0 and next(Build.Tiles) ~= nil then
-        local r = Build.breakSession(o)
-        if r ~= nil then return r end -- nil = tidak bisa ke posisi break: pakai cara otomatis
-    end
-    local spot = nil
-    if o.stand then
-        local s0 = playerState()
-        local hx, hy = nil, nil
-        if s0 then hx, hy = startNode(s0) end
-        if hx ~= o.stand.x or hy ~= o.stand.y then
-            Build.Status = ("Jalan ke posisi pasang-pecah (%d,%d)"):format(o.stand.x, o.stand.y)
-            if not walkTo(o.stand.x, o.stand.y, 45) then o.stand = nil end
-        end
-        if o.stand and o.tile then
-            local id = fgIdAt(o.tile.x, o.tile.y)
-            if id == o.block or (id == 0 and placeOk(o.tile.x, o.tile.y)) then spot = o.tile end
-        end
-    end
-    local s = playerState()
-    if not s or not s.grounded then return false end
-    if not spot then
-        local R = farmReach() - 0.08
-        local ty = floor(s.y - 0.475)
-        for _, dx in ipairs({ 1, 2, -1, -2 }) do -- kanan dulu
-            local tx = floor(s.x) + dx
-            local idx = ty * w.w + tx
-            if tx >= 0 and tx < w.w and ty >= 0 and fgIdAt(tx, ty) == 0
-                and not (o.plantSet and o.plantSet[idx]) and not (o.exclude and o.exclude[idx])
-                and stateReaches(s, tx, ty, R) and not overlapsPlayer(tx, ty, s) and placeOk(tx, ty) then
-                spot = { x = tx, y = ty }
-                break
-            end
-        end
-    end
-    if not spot then return false end
-    -- 1 sesi panjang (seperti Pabrik): pasang-pecah terus sampai seed cukup untuk mengisi
-    -- semua tempat kosong di baris produksi, atau block habis. Tidak diselingi panen / tanam.
-    local before = invCount(o.seed)
-    local want = math.max(1, Build.freeSpots(o))
-    for _ = 1, 300 do
-        if not o.live() or (invCount(o.block) <= 0 and fgIdAt(spot.x, spot.y) == 0) then break end
-        if invCount(o.seed) >= before + want then break end
-        if fgIdAt(spot.x, spot.y) == 0 then
-            sendSetTile("fg", spot.x, spot.y, o.block)
-            pcall(function() Refs.Inv:remove(o.block, 1) end)
-            PlacedAt[spot.x .. "," .. spot.y] = os.clock()
-            Build.Status = ("Pasang & pecah %s untuk dapat seed (%d,%d)"):format(itemName(o.block), spot.x, spot.y)
-            if not waitAuto(State.PlaceMs) then break end
-        end
-        for _ = 1, 40 do
-            if not o.live() then break end
-            local r = tryBreak(spot.x, spot.y, false)
-            if r == nil or r == "broke" then break end
-            if not waitAuto(State.BreakMs) then break end
-        end
-        -- tunggu drop muncul (datang dari server), lalu ambil dengan sentuhan: melangkah masuk lalu balik
-        Drops.waitSpawn({ spot })
-        local s2 = playerState()
-        if s2 and s2.grounded then
-            local hx, hy = startNode(s2)
-            if not Drops.touch(spot, hx, hy) then waitNearDrops(0.3) end
-        end
-    end
-    return invCount(o.seed) > before
-end
-
--- 1 langkah produksi. Hasil: "work" | "move" | "wait" | "next" | "idle" (+ detik pohon siap, jumlah pohon siap)
--- Siklus berurutan (seperti Pabrik), tiap fase diselesaikan dulu, tidak saling potong:
---   PANEN : panen SEMUA pohon siap di lahan (baris per baris), hasilnya diambil   -> TANAM
---   TANAM : isi semua tempat kosong di baris produksi                              -> BREAK / TUNGGU
---   BREAK : seed habis & baris belum penuh: pasang-pecah di kanan karakter sampai
---           seed cukup untuk mengisi baris (atau block habis)                      -> TANAM
---   TUNGGU: tunggu pohon siap SEKALIGUS (tidak ada lagi yang siap dalam 20 dtk)   -> PANEN
-function Build.produceStep(o)
-    o.phase = o.phase or "panen"
-    if o.phase == "panen" then
-        FC = Build.cfg(o, true, false)
-        local r = fieldStep()
-        if r == "idle" then
-            o.phase = "tanam"
-            return "next"
-        end
-        return r
-    end
-    if o.phase == "tanam" then
-        if invCount(o.seed) > 0 and Build.freeSpots(o) > 0 then
-            FC = Build.cfg(o, false, true)
-            local r = fieldStep()
-            if r ~= "idle" then return r end
-        end
-        if not o.broke and Build.freeSpots(o) > 0 and invCount(o.seed) <= 0 and invCount(o.block) > 0 then
-            o.phase = "break"
-        else
-            o.phase, o.broke = "tunggu", nil
-        end
-        return "next"
-    end
-    if o.phase == "break" then
-        o.broke = true -- 1 sesi break tiap putaran
-        o.bootAt = os.clock()
-        Build.bootstrap(o)
-        o.phase = "tanam"
-        return "work"
-    end
-    -- TUNGGU
-    local n, nxt = readyTreeCount(false, o.seed)
-    if n > 0 and (nxt == nil or nxt > 20) then
-        o.phase = "panen" -- pohon siap sekaligus
-        return "next"
-    end
-    if n == 0 and nxt == nil and Build.freeSpots(o) > 0 and os.clock() - (o.retryAt or 0) > 10 then
-        -- tidak ada pohon tumbuh sama sekali (break tadi tidak dapat seed): tanam / break lagi
-        if invCount(o.seed) > 0 or (invCount(o.block) > 0 and os.clock() - (o.bootAt or 0) > 5) then
-            o.retryAt = os.clock()
-            o.phase = "tanam"
-            return "next"
-        end
-    end
-    return "idle", nxt, n
-end
-
--- Bersihkan drop di dalam lahan PER BARIS (scan daftar drop game), seperti main manual:
---   baris terdekat dulu, disusuri dari ujung ke ujung tanpa berhenti (terambil sambil lewat),
---   lalu pindah ke baris sebelahnya. ids = nil (semua) atau { [id] = true }
-function Build.sweep(P, live, ids, maxSec)
-    if not Drops.list then return 0 end
-    local x0, x1 = P.x0, P.x1 + 1
-    local y0, y1 = math.max(0, P.rows[1] - 1), P.rows[P.K] + 1
-    return Move.fetchDrops(live, 999, function(d)
-        return d.x >= x0 and d.x < x1 and d.y >= y0 and d.y < y1 and (not ids or ids[d.id] == true)
-    end, maxSec or 60)
-end
-
-function Build.stop(reason)
-    Build.Running = false
-    if Pabrik.Running == false and State.Override then State.Running = false end
-    autoEnd()
-    releaseInput()
-    Build.Phase = reason or "Dihentikan"
-    if UI.BuildToggle then pcall(function() UI.BuildToggle:Set(false) end) end
-    if reason then
-        notify("Bangun Lahan", reason, 5)
-        if not string.find(reason, "^Dihentikan") then Hook.send("pabrik", "Bangun Lahan: " .. reason) end
-    end
-end
-
-local function buildLoop(runId)
-    local function live() return Build.Running and alive() and Build.RunId == runId end
-    local seed = seedOfBlock(Build.BlockId)
-    local o = { seed = seed, block = Build.BlockId, live = live }
-    local phase = nil
-    local noneAt = nil
-    while live() do
-        task.wait()
-        local P = Build.plan()
-        if not P then
-            Build.stop("Tidak ada baris lahan (cek X awal / X akhir / Y baris atas)")
-            break
-        end
-        if Build.Surface == nil then Build.Surface = Build.findSurface(P) end
-        local carve = Build.carveList(P)
-        local info = landInfo(Build.BlockId, P, carve)
-        Build.Info = info
-        Build.InfoAt = os.clock()
-
-        -- 1) GALI dulu sampai bawah
-        local r = "none"
-        if #carve > 0 then
-            Build.Reserve = 0
-            Build.Phase = ("Gali: sisa %d tile"):format(#carve)
-            r = Build.carveStep(P, carve, live)
-            if r ~= "none" then noneAt = nil end
-        end
-        if r == "none" and #carve == 0 and not o.dugSwept then
-            -- gali selesai: ambil dulu semua drop sisa galian, per baris
-            o.dugSwept, o.sweptAt = true, os.clock()
-            Build.Phase = "Bersihkan drop sisa galian (per baris)"
-            Build.sweep(P, live, nil, 600)
-            continue
-        end
-        if r == "none" then
-            local have = invCount(Build.BlockId)
-            if info.need == 0 then
-                -- tinggal tile gali yang dilewati: coba lagi sebentar
-                if #carve > 0 then
-                    noneAt = noneAt or os.clock()
-                    local waited = os.clock() - noneAt
-                    if waited < 45 then
-                        Build.Status = #carve .. " tile gali belum terjangkau, dicoba lagi"
-                        if waited > 20 and not o.carveReset then
-                            o.carveReset = true
-                            table.clear(Build.Skip)
-                            table.clear(BuildFail)
-                            table.clear(BadEdge)
-                            Reach = nil
-                        end
-                        if not waitAuto(1000) then break end
-                        continue
-                    end
-                end
-                -- 4) BERSIH: ambil semua drop yang tertinggal di lahan
-                Build.Phase = "Bersihkan drop di lahan (per baris)"
-                Build.sweep(P, live, nil, 900)
-                if not live() then break end
-                local note = (#carve > 0) and (", " .. #carve .. " tile gali dilewati") or ""
-                Build.stop("Lahan selesai (" .. info.done .. " block" .. note .. ")")
-                if Build.ThenPabrik then
-                    if not Pabrik.SeedId then Pabrik.SeedId = seed end
-                    Pabrik.start()
-                end
-                break
-            end
-            local reserve = (have >= info.need or not seed) and 0 or Build.RESERVE
-            if phase ~= "produksi" and have > reserve then
-                -- 2) PASANG (sisakan block untuk produksi kalau masih kurang)
-                phase = "pasang"
-                Build.Reserve = reserve
-                Build.Phase = ("Pasang lahan: sisa %d tile"):format(info.need)
-                    .. ((reserve > 0) and (" (sisakan " .. reserve .. " block)") or "")
-                local pr = Build.placeStep(P)
-                if pr == "none" and invCount(Build.BlockId) > reserve then
-                    Build.Status = "Sisa tile belum terjangkau / terhalang, dicoba lagi"
-                    noneAt = noneAt or os.clock()
-                    if os.clock() - noneAt > 20 then -- lama tidak ada yang bisa dipasang: reset & coba lagi
-                        noneAt = nil
-                        table.clear(Build.Skip)
-                        table.clear(BuildFail)
-                        table.clear(BadEdge)
-                        table.clear(Build.Under)
-                        Reach = nil
-                    end
-                    if not waitAuto(1500) then break end
-                elseif pr ~= "none" then
-                    noneAt = nil
-                end
-            elseif not seed then
-                Build.stop(("Block habis, masih kurang %d (seed-nya tidak ketemu)"):format(info.need))
-                break
-            else
-                -- 3) PRODUKSI
-                if phase ~= "produksi" then
-                    if os.clock() - (o.sweptAt or -1e9) > 120 then
-                        -- ambil dulu drop yang tertinggal di lahan (block, seed & lainnya), per baris
-                        o.sweptAt = os.clock()
-                        Build.Phase = "Ambil drop sisa di lahan (per baris)"
-                        Build.sweep(P, live, nil, 300)
-                        continue
-                    end
-                    phase = "produksi"
-                    o.phase, o.rowK = nil, nil
-                    notify("Bangun Lahan", "Block habis, produksi 1 baris dulu", 4)
-                end
-                local target = math.min(CAP, info.need + Build.RESERVE)
-                if have >= target then
-                    phase = "pasang"
-                    notify("Bangun Lahan", "Block cukup (" .. have .. "), lanjut pasang", 4)
-                else
-                    if o.rowK and not P.rows[o.rowK] then o.rowK = nil end
-                    if o.rowK == nil then
-                        o.rowK = Build.prodRow(P) or false
-                        table.clear(Build.Row)
-                        if o.rowK then
-                            local sp = Build.prodSpots(P, o.rowK)
-                            o.plantSet, o.stand, o.tile, o.exclude = sp.set, sp.stand, sp.tile, nil
-                        else -- belum ada baris lengkap: tanam di mana saja di luar tile lahan
-                            o.plantSet, o.stand, o.tile, o.exclude = nil, nil, nil, landBlockSet()
-                        end
-                    end
-                    Build.Phase = ("Produksi %s: block %d / %d"):format(PHASE_NAME[o.phase or "panen"] or "-", have, target)
-                        .. (o.rowK and (" | baris y " .. P.rows[o.rowK]) or "")
-                    local pr, nextReady, nReady = Build.produceStep(o)
-                    if pr ~= "idle" then o.stuckAt = nil end
-                    if pr == "idle" then
-                        if not nextReady and (nReady or 0) == 0 and invCount(seed) <= 0 and have <= 0 then
-                            Build.stop("Seed & block habis. Butuh " .. info.need .. " block")
-                            break
-                        end
-                        if (nReady or 0) > 0 then
-                            Build.Status = nReady .. " pohon siap belum terjangkau, dicoba lagi"
-                            o.stuckAt = o.stuckAt or os.clock()
-                            if os.clock() - o.stuckAt > 30 then -- reset daftar lewati & jalur
-                                o.stuckAt = nil
-                                table.clear(Build.FieldSkip)
-                                table.clear(BadEdge)
-                                Reach = nil
-                            end
-                        elseif nextReady then
-                            Build.Status = "Menunggu pohon siap ±" .. waitText(nextReady)
-                        elseif invCount(seed) <= 0 then
-                            Build.Status = "Seed habis & tidak ada tempat pasang-pecah di samping karakter"
-                        else
-                            Build.Status = "Tidak ada tempat tanam, menunggu"
-                        end
-                        if not waitAuto(1000) then break end
-                    end
-                end
-            end
-        end
-    end
-    releaseInput()
-end
-
-function Build.start()
-    if Build.Running then return end
-    local err
-    local it = Build.BlockId and ItemDB[Build.BlockId]
-    if not Refs.World then
-        err = "Data world belum ketemu. Tekan 'Hubungkan ke game'"
-    elseif not OrigIsDown then
-        err = "Kontrol gerak game (WorldMenu.isDown) tidak ketemu"
-    elseif not playerState() then
-        err = "Kamu belum masuk world"
-    elseif not (it and it.solid) then
-        err = "Pilih block padat untuk lahan"
-    elseif #landRows() == 0 then
-        err = "Tidak ada baris yang muat (Y atas terlalu bawah). Berdiri di pojok kiri-ATAS lahan lalu tekan 'Pakai posisi karakter'"
-    end
-    if err then
-        notify("Bangun Lahan", err, 4)
-        if UI.BuildToggle then pcall(function() UI.BuildToggle:Set(false) end) end
-        return
-    end
-    if State.Running and not State.Override then stopFarm("Dihentikan karena Bangun Lahan dimulai") end
-    if Clear.Running then stopClear("Dihentikan karena Bangun Lahan dimulai") end
-    if Farmer.Running then stopFarmer("Dihentikan karena Bangun Lahan dimulai") end
-    if Splice.Running and Splice.stop then Splice.stop("Dihentikan karena Bangun Lahan dimulai") end
-    if Pabrik.Running then Pabrik.stop("Dihentikan karena Bangun Lahan dimulai") end
-    if not Refs.Trees then findTreeRefs() end
-    table.clear(Build.Skip)
-    table.clear(BuildFail)
-    table.clear(Build.FieldSkip)
-    table.clear(Build.Row)
-    table.clear(Build.Under)
-    table.clear(Build.BreakTimes)
-    table.clear(BadEdge)
-    Build.Surface = nil -- dihitung ulang (permukaan tanah asli)
-    Build.Reserve = 0
-    Land.Cache = nil
-    Pabrik.BreakFailUntil = 0
-    Build.Running = true
-    Build.RunId = (Build.RunId or 0) + 1
-    Build.Phase = "Menghitung..."
-    autoBegin()
-    if UI.BuildToggle then pcall(function() UI.BuildToggle:Set(true) end) end
-    local id = Build.RunId
-    task.spawn(function()
-        local ok, e = pcall(buildLoop, id)
-        if not ok then
-            warn("[Zekio supreme] Bangun Lahan error: " .. tostring(e))
-            if Build.Running then Build.stop("Error: " .. tostring(e)) end
-        end
-    end)
-end
-
-Auto.landInfo = landInfo
-Auto.landRows = landRows
-Auto.seedOfBlock = seedOfBlock
-Auto.blockOfSeed = blockOfSeed
-Auto.parseDropTarget = parseDropTarget
-
-Auto.walkTo = walkTo
-Auto.startSpliceRoam = startSpliceRoam
-Auto.stopSpliceRoam = stopSpliceRoam
-Auto.treeReadyAt = treeReadyAt
-Auto.plantSpotOk = plantSpotOk
-Auto.stopWalk = function() Move.Homing = false end
-Auto.here = function()
-    local s = playerState()
-    if s then return startNode(s) end
-    return nil
-end
-Auto.startClear = startClear
-Auto.startFarmer = startFarmer
-Auto.updateClearStatus = updateClearStatus
-Auto.updateFarmerStatus = updateFarmerStatus
-Auto.findTreeRefs = findTreeRefs
-Auto.tileOpen = openAt
-Auto.releaseInput = releaseInput
-Auto.BadEdge = BadEdge
-Auto.ClearFail = ClearFail
-Auto.resetReach = function() Reach = nil end
-end)() end -- do (gerak otomatis)
-
----------------------------------------------------------------------
--- TELEPORT KOORDINAT DALAM WORLD (posisi 2D game, bukan CFrame avatar)
----------------------------------------------------------------------
-do (function()
-    local TP = { X = "", Y = "", Busy = false, Status = "Isi X dan Y, lalu tekan Teleport." }
-    Auto.Teleport = TP
-    local function finite(v)
-        return type(v) == "number" and v == v and math.abs(v) < math.huge
-    end
-    local function equal(a, b)
-        return finite(a) and finite(b) and math.abs(a - b) < 0.0001
-    end
-    local function sample()
-        if type(Refs.State) ~= "function" then return nil, "Posisi game belum ditemukan. Tekan Hubungkan ke game." end
-        local ok, s = pcall(Refs.State)
-        if not ok or type(s) ~= "table" or not finite(s.x) or not finite(s.y) then
-            return nil, "Posisi karakter belum terbaca."
-        end
-        if s.active == false or s.dead then return nil, "Karakter belum siap / sedang mati." end
-        return s
-    end
-    local function calibration()
-        local cx, cy = tonumber(State.CalibX or 0), tonumber(State.CalibY or 0)
-        if not finite(cx) or not finite(cy) or cx % 1 ~= 0 or cy % 1 ~= 0 then return nil end
-        return cx, cy
-    end
-    function TP.resolve(x, y)
-        local w = Refs.World
-        if type(w) ~= "table" or not finite(w.w) or not finite(w.h) or w.w <= 0 or w.h <= 0
-            or w.w % 1 ~= 0 or w.h % 1 ~= 0 then
-            return nil, "Masuk ke world dulu, lalu tekan Hubungkan ke game."
-        end
-        x, y = tonumber(x), tonumber(y)
-        if not finite(x) or not finite(y) or x % 1 ~= 0 or y % 1 ~= 0 then
-            return nil, "X dan Y harus berupa bilangan bulat."
-        end
-        local cx, cy = calibration()
-        if cx == nil then return nil, "Kalibrasi koordinat tidak valid." end
-        local px, py = x - cx, y - cy
-        if px < 0 or py < 0 or px >= w.w or py >= w.h then return nil, "Koordinat berada di luar world." end
-        if type(Auto.tileOpen) ~= "function" then return nil, "Pemeriksaan tile belum tersedia." end
-        local ok, open = pcall(Auto.tileOpen, px, py)
-        if not ok or not open then return nil, "Tile tujuan terhalang block atau berbahaya. Pilih tile kosong." end
-        return { tx = x, ty = y, px = px, py = py, x = px + 0.5, y = py + 0.95,
-            world = w, worldName = rawget(w, "name"), getter = Refs.State, owner = Refs.StateOwner }
-    end
-    function TP.capture()
-        if TP.Busy then return false, "Teleport masih berjalan." end
-        if type(Refs.World) ~= "table" then TP.Status = "Masuk ke world dulu."; return false, TP.Status end
-        local s, why = sample()
-        if not s then TP.Status = why; return false, why end
-        local cx, cy = calibration()
-        if cx == nil then TP.Status = "Kalibrasi koordinat tidak valid."; return false, TP.Status end
-        TP.X, TP.Y = tostring(math.floor(s.x) + cx), tostring(math.floor(s.y - 0.475) + cy)
-        TP.Status = "Tujuan diisi dari posisi sekarang: (" .. TP.X .. "," .. TP.Y .. ")."
-        return true
-    end
-    local function sameWorld(target)
-        return Refs.World == target.world and Refs.State == target.getter
-            and rawget(target.world, "name") == target.worldName
-            and (not target.owner or target.owner == Refs.StateOwner)
-    end
-    -- Gunakan tabel posisi yang benar-benar memengaruhi getter game. Salinan state
-    -- untuk UI tidak cukup: setiap percobaan diverifikasi dan dipulihkan jika gagal.
-    function TP.apply(target, state)
-        if not sameWorld(target) then return false, "World berubah; teleport dibatalkan." end
-        local before = { x = state.x, y = state.y, vx = state.vx, vy = state.vy }
-        if equal(before.x, target.x) and equal(before.y, target.y) then TP.Method = "Sudah di tujuan"; return true end
-        local tables, functions, queue, seen = {}, {}, { { value = target.getter, depth = 0 } }, {}
-        local cursor = 1
-        local function push(value, depth)
-            local kind = type(value)
-            if (kind ~= "table" and kind ~= "function") or seen[value] or #queue >= 80 then return end
-            if value == G or value == _G or value == Refs or value == UI or value == ItemDB
-                or value == Session or value == Net then return end
-            seen[value] = true
-            queue[#queue + 1] = { value = value, depth = depth }
-        end
-        seen[target.getter] = true
-        -- state() dapat mengembalikan cache untuk gambar/UI. Fungsi lain pada
-        -- pemilik state memegang data fisika yang memperbarui cache tersebut.
-        if type(target.owner) == "table" and rawget(target.owner, "state") == target.getter then
-            push(target.owner, 0)
-        end
-        while cursor <= #queue do
-            local entry = queue[cursor]
-            cursor = cursor + 1
-            local value = entry.value
-            if type(value) == "function" then
-                functions[#functions + 1] = value
-                if entry.depth < 4 then
-                    for _, up in pairs(getUpvalues(value)) do push(up, entry.depth + 1) end
-                end
-            else
-                if value ~= state and equal(rawget(value, "x"), before.x) and equal(rawget(value, "y"), before.y) then
-                    tables[#tables + 1] = value
-                end
-                if entry.depth < 4 then
-                    for _, key in ipairs({ "state", "body", "physics", "player", "position", "data" }) do
-                        push(rawget(value, key), entry.depth + 1)
-                    end
-                    local n = 0
-                    for key, child in next, value do
-                        n = n + 1
-                        if n > 24 then break end
-                        if key ~= "_G" and key ~= "_ENV" then push(child, entry.depth + 1) end
-                    end
-                end
-            end
-        end
-        -- Utamakan data internal; jangan memilih cache hasil pembacaan lebih dulu.
-        tables[#tables + 1] = state
-        local function arrived()
-            local s = sample()
-            return s and equal(s.x, target.x) and equal(s.y, target.y)
-        end
-        local function frame()
-            task.wait()
-            if not alive() or not sameWorld(target) then return nil, "World / sesi berubah setelah perpindahan." end
-            local s, why = sample()
-            return s, why
-        end
-        local function confirmed()
-            for _ = 1, 2 do
-                local s, why = frame()
-                if not s then return false, why end
-                if math.floor(s.x) == target.px and math.floor(s.y - 0.475) == target.py then return true end
-            end
-            return false, "Posisi bergerak / dikembalikan lagi setelah teleport."
-        end
-        local lostPosition = false
-        local tableAttempts = 0
-        for _, value in ipairs(tables) do
-            tableAttempts = tableAttempts + 1
-            if tableAttempts > 6 then break end
-            if not sameWorld(target) then return false, "World berubah; teleport dibatalkan." end
-            local old = { x = rawget(value, "x"), y = rawget(value, "y"), vx = rawget(value, "vx"), vy = rawget(value, "vy") }
-            if finite(old.x) and finite(old.y) then
-                local written = 0
-                local ok = pcall(function()
-                    rawset(value, "x", target.x); written = written + 1
-                    rawset(value, "y", target.y); written = written + 1
-                    if finite(old.vx) then rawset(value, "vx", 0); written = written + 1 end
-                    if finite(old.vy) then rawset(value, "vy", 0); written = written + 1 end
-                end)
-                local immediate = ok and arrived()
-                if ok and (immediate or value ~= state) then
-                    local holds, why = confirmed()
-                    if holds then TP.Method = "Tabel posisi terkonfirmasi setelah frame game"; return true end
-                    if not alive() or not sameWorld(target) then return false, why end
-                    lostPosition = lostPosition or immediate
-                end
-                if written > 0 then
-                    local restored = pcall(function()
-                        for _, key in ipairs({ "x", "y", "vx", "vy" }) do rawset(value, key, old[key]) end
-                    end)
-                    if not restored then return false, "Data posisi terkunci; perpindahan dihentikan." end
-                end
-            end
-        end
-        -- Sebagian versi game menyimpan x/y pada fungsi penggerak lain dan hanya
-        -- menyalinnya ke state() pada frame berikutnya. Probe kecil dibatasi jumlahnya.
-        local set = (debug and debug.setupvalue) or setupvalue
-        if type(set) ~= "function" then return false, "Executor tidak menyediakan penulisan posisi game." end
-        -- Getter juga bisa membaca posisi dari Vector2 privat, bukan tabel x/y.
-        local vectorAttempts = 0
-        if typeof and Vector2 and type(Vector2.new) == "function" then
-            for _, fn in ipairs(functions) do
-                for index, old in pairs(getUpvalues(fn)) do
-                    if type(index) == "number" and index >= 1 and index % 1 == 0 and typeof(old) == "Vector2"
-                        and equal(old.X, before.x) and equal(old.Y, before.y) and vectorAttempts < 6 then
-                        vectorAttempts = vectorAttempts + 1
-                        if not sameWorld(target) then return false, "World berubah; teleport dibatalkan." end
-                        local ok = pcall(set, fn, index, Vector2.new(target.x, target.y))
-                        if ok then
-                            local holds, why = confirmed()
-                            if holds then TP.Method = "Vector2 posisi terkonfirmasi setelah frame game"; return true end
-                            if not alive() or not sameWorld(target) then return false, why end
-                        end
-                        local restored = pcall(set, fn, index, old)
-                        local after, frameError = frame()
-                        if not after then return false, frameError end
-                        if not restored or getUpvalues(fn)[index] ~= old or not after
-                            or not equal(after.x, before.x) or not equal(after.y, before.y) then
-                            return false, "Posisi Vector2 tidak bisa dipulihkan; perpindahan dihentikan."
-                        end
-                    end
-                end
-            end
-        end
-        local checks, delayed = 0, 0
-        local stationary = state.grounded ~= false and math.abs(before.vx or 0) <= 0.05 and math.abs(before.vy or 0) <= 0.05
-        local function binding(field)
-            if not finite(before[field]) then return nil end
-            for _, fn in ipairs(functions) do
-                for index, old in pairs(getUpvalues(fn)) do
-                    if type(index) == "number" and index >= 1 and index % 1 == 0 and equal(old, before[field]) then
-                        checks = checks + 1
-                        if checks > 128 then return nil end
-                        if not sameWorld(target) then return nil, "World berubah; teleport dibatalkan." end
-                        local step = field == "y" and -0.25 or 0.125
-                        if field == "x" and old % 1 > 0.5 then step = -step end
-                        local probe = old + step
-                        local ok = pcall(set, fn, index, probe)
-                        local current = ok and sample() or nil
-                        local matched = probe ~= old and current and equal(current[field], probe)
-                        if matched then
-                            for _, other in ipairs({ "x", "y", "vx", "vy" }) do
-                                if other ~= field and finite(before[other]) and not equal(current[other], before[other]) then matched = false end
-                            end
-                        end
-                        local deferred = false
-                        if not matched and ok and stationary and (field == "x" or field == "y") and delayed < 12 then
-                            delayed, deferred = delayed + 1, true
-                            for _ = 1, 2 do
-                                local why
-                                current, why = frame()
-                                if not current then return nil, why end
-                                local other = field == "x" and "y" or "x"
-                                local tolerance = field == "x" and 0.04 or 0.08
-                                matched = math.abs(current[field] - probe) <= tolerance
-                                    and math.abs(current[field] - old) >= math.abs(step) / 2
-                                    and math.abs(current[other] - before[other]) <= 0.04
-                                if matched then break end
-                            end
-                        end
-                        local restored = pcall(set, fn, index, old)
-                        local after = sample()
-                        if deferred then
-                            for _ = 1, 2 do
-                                local why
-                                after, why = frame()
-                                if not after then return nil, why end
-                                if equal(after.x, before.x) and equal(after.y, before.y) then break end
-                            end
-                        end
-                        restored = restored and equal(getUpvalues(fn)[index], old) and after ~= nil
-                        if restored then
-                            for _, key in ipairs({ "x", "y", "vx", "vy" }) do
-                                if finite(before[key]) and (not deferred or key == "x" or key == "y")
-                                    and not equal(after[key], before[key]) then restored = false end
-                            end
-                        end
-                        if not restored then return nil, "Upvalue posisi tidak bisa dipulihkan; perpindahan dihentikan." end
-                        if matched then return { fn = fn, index = index, old = old } end
-                    end
-                end
-            end
-        end
-        local bx, whyX = binding("x")
-        if whyX then return false, whyX end
-        local by, whyY = binding("y")
-        if whyY then return false, whyY end
-        if not bx or not by then
-            TP.Method = "Sumber posisi penggerak belum terkonfirmasi"
-            if lostPosition then return false, "Perubahan posisi tidak bertahan; sumber gerak belum bisa dipastikan." end
-            if not stationary then return false, "Berdiri diam di lantai dulu agar sumber posisi dapat diperiksa." end
-            return false, "Posisi game belum bisa ditulis oleh executor ini."
-        end
-        local changes = { { bind = bx, value = target.x }, { bind = by, value = target.y } }
-        for _, field in ipairs({ "vx", "vy" }) do
-            local b, why = binding(field)
-            if why then return false, why end
-            if b then changes[#changes + 1] = { bind = b, value = 0 } end
-        end
-        if not sameWorld(target) then return false, "World berubah; teleport dibatalkan." end
-        local ok = pcall(function()
-            for _, change in ipairs(changes) do set(change.bind.fn, change.bind.index, change.value) end
-        end)
-        if ok then
-            local holds, why = confirmed()
-            if holds then TP.Method = "Posisi privat penggerak terkonfirmasi setelah frame game"; return true end
-            if not alive() or not sameWorld(target) then return false, why end
-        end
-        for i = #changes, 1, -1 do
-            local b = changes[i].bind
-            pcall(set, b.fn, b.index, b.old)
-        end
-        return false, "Posisi bergerak / dikembalikan lagi setelah teleport."
-    end
-    function TP.run()
-        if TP.Busy then return false, "Teleport masih berjalan." end
-        local target, why = TP.resolve(TP.X, TP.Y)
-        if not target then TP.Status = why; return false, why end
-        local state, stateError = sample()
-        if not state then TP.Status = stateError; return false, stateError end
-        if State.Running or State.Override or Clear.Running or Farmer.Running or Pabrik.Running
-            or Pabrik.Traveling or Build.Running or Splice.Running or Splice.Roaming or Vend.Running or AutoInput.active then
-            TP.Status = "Jeda Auto Farm / aktivitas gerak dulu sebelum teleport."
-            return false, TP.Status
-        end
-        TP.Busy = true
-        TP.Method = "Memeriksa sumber posisi"
-        local ok, result, err = pcall(function()
-            if not alive() or not sameWorld(target) then return false, "World berubah; teleport dibatalkan." end
-            TP.Status = ("Memindahkan ke (%d,%d)..."):format(target.tx, target.ty)
-            local moved, reason = TP.apply(target, state)
-            if not moved then return false, reason end
-            pcall(Auto.resetReach)
-            -- Hanya periksa hasil. Jangan paksa ulang posisi jika game mengembalikannya.
-            for _ = 1, 3 do
-                task.wait(0.15)
-                if not alive() or not sameWorld(target) then return false, "World / sesi berubah setelah perpindahan." end
-                local s = sample()
-                if not s or math.floor(s.x) ~= target.px or math.floor(s.y - 0.475) ~= target.py then
-                    return false, "Posisi bergerak / dikembalikan lagi setelah teleport."
-                end
-            end
-            return true
-        end)
-        TP.Busy = false
-        if not ok then TP.Status = "Teleport gagal: " .. string.sub(tostring(result), 1, 180)
-        elseif not result then TP.Status = err or "Teleport belum berhasil."
-        else TP.Status = ("Posisi terbaca di tile (%d,%d)."):format(target.tx, target.ty) end
-        return ok and result == true, TP.Status
-    end
-    function TP.text()
-        local s = sample()
-        local cx, cy = calibration()
-        local current = s and cx and (("(%d,%d)"):format(math.floor(s.x) + cx, math.floor(s.y - 0.475) + cy)) or "belum terbaca"
-        return "World: " .. tostring(Refs.World and Refs.World.name or "-")
-            .. "\nPosisi sekarang: " .. current .. "\nTujuan: (" .. tostring(TP.X) .. "," .. tostring(TP.Y) .. ")"
-            .. "\nPemeriksaan: " .. tostring(TP.Method or "-")
-            .. "\nTeleport r5: " .. TP.Status
-    end
-end)() end
-
----------------------------------------------------------------------
--- AUTO CHAT
----------------------------------------------------------------------
--- Pesan dikirim ke chat world, bergantian sesuai urutan
-local TextChatService = game:GetService("TextChatService")
-
-local function worldChannel()
-    local folder = TextChatService:FindFirstChild("WorldChannels")
-    if not folder then return nil end
-    local name = Refs.World and Refs.World.name
-    if type(name) == "string" and name ~= "" then
-        local ch = folder:FindFirstChild(name)
-        if ch then return ch end
-    end
-    -- cadangan: cari channel yang ada kita
-    for _, ch in ipairs(folder:GetChildren()) do
-        if ch:IsA("TextChannel") then
-            for _, src in ipairs(ch:GetChildren()) do
-                if src:IsA("TextSource") and src.UserId == LocalPlayer.UserId then return ch end
-            end
-        end
-    end
-    return nil
-end
-
-local function parseSpamTexts(raw)
-    local out = {}
-    for part in string.gmatch(raw or "", "[^|\n]+") do
-        part = part:gsub("^%s+", ""):gsub("%s+$", "")
-        if part ~= "" then out[#out + 1] = part end
-    end
-    return out
-end
-
-local lastSpamText = nil
-local function updateSpamStatus()
-    if not UI.SpamStatus then return end
-    local txt = "Status   : " .. (Spam.On and "JALAN" or "BERHENTI")
-        .. "\nPesan    : " .. #Spam.Texts .. " (bergantian)"
-        .. "\nTerkirim : " .. Spam.Sent
-        .. "\nTerakhir : " .. Spam.Last
-    if txt == lastSpamText then return end
-    lastSpamText = txt
-    task.defer(function()
-        pcall(function() UI.SpamStatus:SetDesc(txt) end)
-    end)
-end
-
--- Kirim pesan berikutnya
-local function sendNextChat()
-    if #Spam.Texts == 0 then
-        Spam.Last = "Daftar pesan kosong"
-        return false
-    end
-    local ch = worldChannel()
-    if not ch then
-        Spam.Last = "Channel chat world belum ada (masuk world dulu)"
-        return false
-    end
-    if Spam.Index > #Spam.Texts then Spam.Index = 1 end
-    local msg = Spam.Texts[Spam.Index]
-    Spam.Index = Spam.Index % #Spam.Texts + 1
-    local ok, err = pcall(ch.SendAsync, ch, msg)
-    if ok then
-        Spam.Sent += 1
-        Spam.Last = msg
-    else
-        Spam.Last = "Gagal: " .. tostring(err)
-    end
-    return ok
-end
-
-Spam.NextAt = 0
-task.spawn(function()
-    while alive() do
-        if Spam.On and os.clock() >= Spam.NextAt then
-            sendNextChat()
-            Spam.NextAt = os.clock() + math.max(3, Spam.IntervalSec)
-            updateSpamStatus()
-        end
-        task.wait(0.25)
-    end
-end)
-
----------------------------------------------------------------------
--- WATERMARK NAMA Zekio supreme (hanya di layar sendiri)
----------------------------------------------------------------------
--- Nama asli (huruf gambar "BitmapText") disembunyikan, diganti teks beranimasi:
--- warna gradient mengalir + denyut halus. Pemain lain tetap melihat nama asli.
--- Selalu aktif sebagai penanda script (tidak ada tombol on/off).
-local TextService = game:GetService("TextService")
-local NameFx = { t0 = os.clock() }
-
-local NAME_COLORS = ColorSequence.new({
-    ColorSequenceKeypoint.new(0.00, Color3.fromRGB(170, 90, 255)),  -- ungu
-    ColorSequenceKeypoint.new(0.25, Color3.fromRGB(60, 205, 255)),  -- biru muda
-    ColorSequenceKeypoint.new(0.50, Color3.fromRGB(255, 110, 210)), -- pink
-    ColorSequenceKeypoint.new(0.75, Color3.fromRGB(60, 205, 255)),
-    ColorSequenceKeypoint.new(1.00, Color3.fromRGB(170, 90, 255)),
-})
-local NAME_FONT = Enum.Font.FredokaOne
-
--- Tempat nama: di atas karakter & panel kiri atas
-local function nameHolders()
-    local gg = PlayerGui:FindFirstChild("GameGui")
-    local world = gg and gg:FindFirstChild("World")
-    local cam = world and world:FindFirstChild("Camera")
-    local chat = PlayerGui:FindFirstChild("ChatGui")
-    local hud = chat and chat:FindFirstChild("HUD")
-    local panel = hud and hud:FindFirstChild("PlayerPanel")
-    return cam and cam:FindFirstChild("NameTag"), panel and panel:FindFirstChild("Name")
-end
-
-local function textWidth(text, size)
-    local ok, v = pcall(TextService.GetTextSize, TextService, text, size, NAME_FONT, Vector2.new(2000, 200))
-    return (ok and v.X or #text * size * 0.55) + 6 -- +6 untuk garis tepi
-end
-
-local function makeLabel(holder, size, isTag)
-    local lb = Instance.new("TextLabel")
-    lb.Name = "KzoyzName"
-    lb.BackgroundTransparency = 1
-    lb.Font = NAME_FONT
-    lb.TextSize = size
-    lb.TextColor3 = Color3.new(1, 1, 1)
-    lb.Text = Misc.NameText
-    lb.ZIndex = isTag and 1017 or 10
-    if isTag then
-        lb.AnchorPoint = Vector2.new(0.5, 0.5) -- denyut dari tengah
-        lb.Position = UDim2.fromScale(0.5, 0.5)
-    else
-        lb.AnchorPoint = Vector2.new(0, 0.5)
-        lb.Position = UDim2.new(0, 3, 0.5, 0)
-        lb.TextXAlignment = Enum.TextXAlignment.Left
-    end
-    local st = Instance.new("UIStroke")
-    st.Thickness = 2
-    st.Color = Color3.fromRGB(25, 12, 40)
-    st.Transparency = 0.1
-    st.Parent = lb
-    local gr = Instance.new("UIGradient")
-    gr.Color = NAME_COLORS
-    gr.Rotation = 12
-    gr.Parent = lb
-    local sc = Instance.new("UIScale")
-    sc.Parent = lb
-    lb.Parent = holder
-    return { holder = holder, bitmap = holder:FindFirstChild("BitmapText"), label = lb, gr = gr, sc = sc,
-        size = size, isTag = isTag, text = nil, w = 0 }
-end
-
-local function dropEntry(e)
-    if not e then return end
-    pcall(function() e.label:Destroy() end)
-    if e.bitmap then pcall(function() e.bitmap.Visible = true end) end
-    if e.isTag and e.bitmap then
-        -- kembalikan ukuran tag & posisi wrench sesuai nama asli
-        pcall(function()
-            local bw = e.bitmap.Size.X.Offset
-            e.holder.Size = UDim2.fromOffset(bw, e.holder.Size.Y.Offset)
-            local wr = e.holder:FindFirstChild("Wrench")
-            if wr then wr.Position = UDim2.fromOffset(bw + 4, wr.Position.Y.Offset) end
-        end)
-    end
-end
-
-local function nameRestore()
-    dropEntry(NameFx.tag)
-    dropEntry(NameFx.panel)
-    NameFx.tag, NameFx.panel = nil, nil
-end
-
--- Pastikan label ada, nama asli tersembunyi, ukuran tag pas dengan teks
-local function nameKeep(e, holder, size, isTag)
-    if not holder then
-        dropEntry(e)
-        return nil
-    end
-    if not e or e.holder ~= holder or not e.label.Parent then
-        dropEntry(e)
-        e = makeLabel(holder, size, isTag)
-    end
-    if e.text ~= Misc.NameText then
-        e.text = Misc.NameText
-        e.label.Text = Misc.NameText
-        e.w = textWidth(Misc.NameText, size)
-    end
-    if e.bitmap and e.bitmap.Visible then e.bitmap.Visible = false end
-    if isTag then
-        local h = math.max(holder.Size.Y.Offset, size + 6)
-        if e.label.Size.X.Offset ~= e.w or e.label.Size.Y.Offset ~= h then
-            e.label.Size = UDim2.fromOffset(e.w, h)
-        end
-        if holder.Size.X.Offset ~= e.w then
-            holder.Size = UDim2.fromOffset(e.w, holder.Size.Y.Offset) -- bendera tetap di kiri nama
-        end
-        local wr = holder:FindFirstChild("Wrench")
-        if wr and wr.Position.X.Offset ~= e.w + 4 then
-            wr.Position = UDim2.fromOffset(e.w + 4, wr.Position.Y.Offset)
-        end
-    else
-        e.label.Size = UDim2.new(1, -6, 1, 0)
-    end
-    return e
-end
-
--- Animasi tiap frame: gradient mengalir + denyut halus
-table.insert(Connections, RunService.RenderStepped:Connect(function()
-    if not alive() or not Misc.CustomName then return end
-    local tag, panelName = nameHolders()
-    NameFx.tag = nameKeep(NameFx.tag, tag, 22, true)
-    NameFx.panel = nameKeep(NameFx.panel, panelName, 21, false)
-    local t = os.clock() - NameFx.t0
-    local offset = Vector2.new(((t * 0.45) % 2) - 1, 0)
-    local pulse = 1 + 0.045 * math.sin(t * 3.2)
-    local tg, pn = NameFx.tag, NameFx.panel
-    if tg then
-        tg.gr.Offset = offset
-        tg.sc.Scale = pulse
-    end
-    if pn then
-        pn.gr.Offset = offset
-        pn.sc.Scale = pulse
-    end
-end))
-
----------------------------------------------------------------------
--- ANTI AFK
----------------------------------------------------------------------
-table.insert(Connections, LocalPlayer.Idled:Connect(function()
-    if State.AntiAfk and alive() then
-        VirtualUser:CaptureController()
-        VirtualUser:ClickButton2(Vector2.new())
-    end
-end))
-
----------------------------------------------------------------------
--- GUI TAMBAHAN: Grid Tile 5x5 + tombol Fly ▲/▼
----------------------------------------------------------------------
-local guiParent = (gethui and gethui()) or game:GetService("CoreGui")
-
-local function newScreenGui(name)
-    local sg = Instance.new("ScreenGui")
-    sg.Name = name
-    sg.ResetOnSpawn = false
-    sg.IgnoreGuiInset = true
-    sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    sg.DisplayOrder = 999
-    sg.Enabled = false
-    if syn and syn.protect_gui then pcall(syn.protect_gui, sg) end
-    sg.Parent = guiParent
-    return sg
-end
-
-local GRID_RADIUS = 3
-local CELL = 38
-local GAP = 4
-
-local GridGui = newScreenGui("KzoyzGrid")
-UI.GridGui = GridGui
-
-local side = GRID_RADIUS * 2 + 1
-local gridSize = side * CELL + (side - 1) * GAP
-
-local Panel = Instance.new("Frame")
-Panel.Size = UDim2.fromOffset(gridSize + 20, gridSize + 96)
-Panel.Position = UDim2.fromOffset(20, 80)
-Panel.BackgroundColor3 = Color3.fromRGB(22, 22, 28)
-Panel.BorderSizePixel = 0
-Panel.Parent = GridGui
-Instance.new("UICorner", Panel).CornerRadius = UDim.new(0, 10)
-local pStroke = Instance.new("UIStroke", Panel)
-pStroke.Color = Color3.fromRGB(70, 70, 90)
-
-local Title = Instance.new("TextLabel")
-Title.Size = UDim2.new(1, -40, 0, 28)
-Title.Position = UDim2.fromOffset(10, 4)
-Title.BackgroundTransparency = 1
-Title.Font = Enum.Font.GothamBold
-Title.TextSize = 13
-Title.TextXAlignment = Enum.TextXAlignment.Left
-Title.TextColor3 = Color3.fromRGB(235, 235, 245)
-Title.Text = I18N.T("Grid Tile")
-Title.Parent = Panel
-
-local CloseBtn = Instance.new("TextButton")
-CloseBtn.Size = UDim2.fromOffset(24, 24)
-CloseBtn.Position = UDim2.new(1, -30, 0, 6)
-CloseBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 75)
-CloseBtn.Text = "X"
-CloseBtn.Font = Enum.Font.GothamBold
-CloseBtn.TextSize = 12
-CloseBtn.TextColor3 = Color3.new(1, 1, 1)
-CloseBtn.Parent = Panel
-Instance.new("UICorner", CloseBtn).CornerRadius = UDim.new(0, 6)
-CloseBtn.MouseButton1Click:Connect(function()
-    GridGui.Enabled = false
-end)
-
-local GridHolder = Instance.new("Frame")
-GridHolder.Size = UDim2.fromOffset(gridSize, gridSize)
-GridHolder.Position = UDim2.fromOffset(10, 36)
-GridHolder.BackgroundTransparency = 1
-GridHolder.Parent = Panel
-
-local COLOR_OFF = Color3.fromRGB(48, 48, 60)
-local COLOR_ON = Color3.fromRGB(46, 160, 90)
-local COLOR_ME = Color3.fromRGB(60, 110, 220)
-local CellButtons = {}
-
--- Grid dipakai untuk 2 hal: tile Auto Farm, atau tile break Pabrik
-UI.GridMode = "farm"
-UI.gridTarget = function()
-    if UI.GridMode == "pabrik" then return Pabrik.Tiles end
-    if UI.GridMode == "lahan" then return Build.Tiles end
-    return State.Offsets
-end
-
-local function paintCell(key)
-    local b = CellButtons[key]
-    if b then b.BackgroundColor3 = UI.gridTarget()[key] and COLOR_ON or COLOR_OFF end
-end
-
-for row = 0, side - 1 do
-    for col = 0, side - 1 do
-        local dx, dy = col - GRID_RADIUS, row - GRID_RADIUS
-        local key = dx .. "," .. dy
-        local btn = Instance.new("TextButton")
-        btn.Size = UDim2.fromOffset(CELL, CELL)
-        btn.Position = UDim2.fromOffset(col * (CELL + GAP), row * (CELL + GAP))
-        btn.Font = Enum.Font.GothamBold
-        btn.TextSize = 12
-        btn.TextColor3 = Color3.new(1, 1, 1)
-        btn.Parent = GridHolder
-        Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
-
-        if dx == 0 and dy == 0 then
-            btn.Text = "ME"
-            btn.BackgroundColor3 = COLOR_ME
-            btn.AutoButtonColor = false
-        else
-            btn.Text = ""
-            btn.BackgroundColor3 = UI.gridTarget()[key] and COLOR_ON or COLOR_OFF
-            CellButtons[key] = btn
-            btn.MouseButton1Click:Connect(function()
-                local tgt = UI.gridTarget()
-                tgt[key] = (not tgt[key]) or nil
-                paintCell(key)
-                updateStatus()
-            end)
-        end
-    end
-end
-
-local GridStart = Instance.new("TextButton")
-GridStart.Size = UDim2.new(1, -20, 0, 30)
-GridStart.Position = UDim2.new(0, 10, 1, -54)
-GridStart.BackgroundColor3 = COLOR_ON
-GridStart.Font = Enum.Font.GothamBold
-GridStart.TextSize = 14
-GridStart.TextColor3 = Color3.new(1, 1, 1)
-GridStart.Text = "START"
-GridStart.Parent = Panel
-Instance.new("UICorner", GridStart).CornerRadius = UDim.new(0, 8)
-UI.GridStart = GridStart
-GridStart.MouseButton1Click:Connect(function()
-    if UI.GridMode == "lahan" then
-        if Build.Running then Build.stop() elseif Build.start then Build.start() end
-    elseif UI.GridMode == "pabrik" then
-        if Pabrik.Running then Pabrik.stop() else Pabrik.start() end
-    elseif State.Running and not State.Override then
-        stopFarm()
-    else
-        startFarm()
-    end
-end)
-
-local ClearBtn = Instance.new("TextButton")
-ClearBtn.Size = UDim2.new(1, -20, 0, 18)
-ClearBtn.Position = UDim2.new(0, 10, 1, -22)
-ClearBtn.BackgroundTransparency = 1
-ClearBtn.Font = Enum.Font.Gotham
-ClearBtn.TextSize = 12
-ClearBtn.TextColor3 = Color3.fromRGB(180, 180, 195)
-ClearBtn.Text = I18N.T("Bersihkan pilihan")
-ClearBtn.Parent = Panel
-ClearBtn.MouseButton1Click:Connect(function()
-    local tgt = UI.gridTarget()
-    for key in pairs(tgt) do
-        tgt[key] = nil
-        paintCell(key)
-    end
-    updateStatus()
-end)
-
--- Tombol ganti mode Grid: Farm (tile Auto Farm) / Pabrik (tile break pabrik)
-do (function()
-    local ModeBtn = Instance.new("TextButton")
-    ModeBtn.Size = UDim2.fromOffset(62, 22)
-    ModeBtn.Position = UDim2.new(1, -98, 0, 7)
-    ModeBtn.Font = Enum.Font.GothamBold
-    ModeBtn.TextSize = 11
-    ModeBtn.TextColor3 = Color3.new(1, 1, 1)
-    ModeBtn.Parent = Panel
-    Instance.new("UICorner", ModeBtn).CornerRadius = UDim.new(0, 6)
-    Title.Size = UDim2.new(1, -106, 0, 28)
-
-    local function apply()
-        local pab = UI.GridMode == "pabrik"
-        local lah = UI.GridMode == "lahan"
-        ModeBtn.Text = lah and I18N.T("Lahan") or (pab and I18N.T("Pabrik") or "Farm")
-        ModeBtn.BackgroundColor3 = lah and Color3.fromRGB(60, 140, 200)
-            or (pab and Color3.fromRGB(200, 120, 40) or Color3.fromRGB(60, 60, 75))
-        Title.Text = I18N.T(lah and "Tile Break Lahan" or (pab and "Tile Break Pabrik" or "Grid Tile"))
-        for key in pairs(CellButtons) do paintCell(key) end
-        if lah then
-            GridStart.Text = I18N.T(Build.Running and "STOP LAHAN" or "START LAHAN")
-            GridStart.BackgroundColor3 = Build.Running and Color3.fromRGB(200, 60, 60) or COLOR_ON
-        elseif pab then
-            GridStart.Text = I18N.T(Pabrik.Running and "STOP PABRIK" or "START PABRIK")
-            GridStart.BackgroundColor3 = Pabrik.Running and Color3.fromRGB(200, 60, 60) or COLOR_ON
-        else
-            local run = State.Running and not State.Override
-            GridStart.Text = run and "STOP" or "START"
-            GridStart.BackgroundColor3 = run and Color3.fromRGB(200, 60, 60) or COLOR_ON
-        end
-    end
-
-    UI.setGridMode = function(m)
-        UI.GridMode = m
-        apply()
-    end
-    ModeBtn.MouseButton1Click:Connect(function() -- Farm -> Pabrik -> Lahan -> Farm
-        local nxt = { farm = "pabrik", pabrik = "lahan", lahan = "farm" }
-        UI.setGridMode(nxt[UI.GridMode] or "farm")
-    end)
-    apply()
-end)() end
-
--- Panel bisa digeser lewat judul
-do (function() -- fungsi sendiri: variabel di dalam tidak ikut batas 200 local
-    local dragging, dragStart, startPos
-    Title.Active = true
-    Title.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1
-            or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
-            dragStart = input.Position
-            startPos = Panel.Position
-            input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then dragging = false end
-            end)
-        end
-    end)
-    table.insert(Connections, UserInputService.InputChanged:Connect(function(input)
-        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
-            or input.UserInputType == Enum.UserInputType.Touch) then
-            local d = input.Position - dragStart
-            Panel.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
-        end
-    end))
-end)() end
-
-task.spawn(function()
-    while alive() do
-        if GridGui.Enabled then
-            local px, py = getPlayerTile()
-            local t = px and ("ME (" .. px .. "," .. py .. ")") or I18N.T("Grid Tile | tidak di world")
-            if Title.Text ~= t then Title.Text = t end
-        end
-        task.wait(0.5)
-    end
-end)
-
--- Tombol ▲/▼ untuk Fly (muncul saat Fly aktif)
-local FlyPad = newScreenGui("KzoyzFlyPad")
-UI.FlyPad = FlyPad
-
-local function flyButton(text, yOffset, onHold)
-    local b = Instance.new("TextButton")
-    b.Size = UDim2.fromOffset(64, 64)
-    b.AnchorPoint = Vector2.new(1, 0.5)
-    b.Position = UDim2.new(1, -24, 0.5, yOffset)
-    b.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
-    b.BackgroundTransparency = 0.2
-    b.Text = text
-    b.Font = Enum.Font.GothamBold
-    b.TextSize = 28
-    b.TextColor3 = Color3.new(1, 1, 1)
-    b.AutoButtonColor = true
-    b.Parent = FlyPad
-    Instance.new("UICorner", b).CornerRadius = UDim.new(1, 0)
-    local st = Instance.new("UIStroke", b)
-    st.Color = Color3.fromRGB(90, 90, 120)
-    st.Thickness = 2
-    -- dilepas saat jari diangkat (walau sudah geser keluar), supaya tidak nyangkut
-    local heldInput = nil
-    b.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.Touch
-            or input.UserInputType == Enum.UserInputType.MouseButton1 then
-            heldInput = input
-            onHold(true)
-        end
-    end)
-    table.insert(Connections, UserInputService.InputEnded:Connect(function(input)
-        if heldInput and (input == heldInput
-            or (input.UserInputType == Enum.UserInputType.MouseButton1
-                and heldInput.UserInputType == Enum.UserInputType.MouseButton1)) then
-            heldInput = nil
-            onHold(false)
-        end
-    end))
-    return b
-end
-
-flyButton("▲", -40, function(v) Misc.UpHeld = v end)
-flyButton("▼", 40, function(v) Misc.DownHeld = v end)
-
----------------------------------------------------------------------
--- UI WINDUI
----------------------------------------------------------------------
--- Pilih bahasa saat execute (sebelum menu dibuat, karena teks menu dipasang sekali)
-do (function()
-    if not I18N.Ask and Config.saved("Bahasa", "Saved") then return end
-    local chosen, late = false, false
-    local function pick(lang)
-        if late then
-            I18N.Saved = lang
-            Config.save(true)
-            notify("Bahasa / Language", "Execute ulang untuk ganti bahasa / Re-execute to apply", 5)
-            return
-        end
-        I18N.Lang, I18N.Saved, chosen = lang, lang, true
-    end
-    local ok = pcall(function()
-        WindUI:Popup({
-            Title = "Zekio supreme",
-            Icon = "languages",
-            Content = "Pilih bahasa menu\nChoose menu language",
-            Buttons = {
-                { Title = "Indonesia", Variant = I18N.Lang == "id" and "Primary" or "Secondary",
-                    Callback = function() pick("id") end },
-                { Title = "English", Variant = I18N.Lang == "en" and "Primary" or "Secondary",
-                    Callback = function() pick("en") end },
-            },
-        })
-    end)
-    if not ok then return end
-    local t0 = os.clock()
-    while not chosen and os.clock() - t0 < 30 and alive() do task.wait(0.1) end
-    late = not chosen -- tidak dipilih dalam 30 detik: pakai bahasa terakhir
-    if chosen then Config.save(true) end
-end)() end
-
-local Window = I18N.wrap(WindUI:CreateWindow({
-    Title = "Zekio supreme",
-    Icon = "sprout",
-    Author = "v5.9.0 | Tester",
-    Folder = "KzoyzOpus",
-    Size = UDim2.fromOffset(640, 380),
-    Theme = "Dark",
-    Transparent = true,
-    SideBarWidth = 150,
-    ToggleKey = Enum.KeyCode.Insert,  -- PC: tekan Insert untuk buka/tutup menu
-}))
--- Tombol minimize muncul di mobile DAN PC (OnlyMobile=false), bisa digeser.
--- Cadangan PC: kalau tombol susah dicari, tekan Insert.
-pcall(function()
-    Window:EditOpenButton({
-        Title = "Zekio supreme",
-        Icon = "sprout",
-        Draggable = true,
-        OnlyMobile = false,
-    })
-end)
-
--- Kalau 1 elemen error, tab lain tetap dibuat
-local function safe(fn)
-    local ok, err = pcall(fn)
-    if not ok then warn("[Zekio supreme] UI error: " .. tostring(err)) end
-end
-
--- Sidebar dikelompokkan: grup utama bisa dibuka / ditutup (isinya tab-tab)
-local Groups = {}
-for _, g in ipairs({
-    { key = "farm", title = "Farming", icon = "sprout", opened = true },
-    { key = "fitur", title = "Fitur", icon = "sparkles" },
-    { key = "aman", title = "Keamanan", icon = "shield" },
-    { key = "setel", title = "Setelan", icon = "settings" },
-}) do
-    local ok, sec = pcall(function()
-        return Window:Section({ Title = g.title, Icon = g.icon, Opened = g.opened == true })
-    end)
-    if ok and type(sec) == "table" and type(sec.Tab) == "function" then Groups[g.key] = sec end
-end
-
-local function makeTab(title, icon, group)
-    local parent = (group and Groups[group]) or Window
-    local ok, tab = pcall(function() return parent:Tab({ Title = title, Icon = icon }) end)
-    if ok and tab then return tab end
-    return Window:Tab({ Title = title })
-end
-
--- Kotak di dalam tab yang bisa dibuka / ditutup (supaya tab tidak terlihat penuh).
--- WindUI lama tanpa fitur ini: cuma judul, elemen tetap di tab.
-local function box(tab, title, opened)
-    local ok, sec = pcall(function()
-        return tab:Section({ Title = title, Box = true, BoxBorder = true, Opened = opened == true })
-    end)
-    if ok and type(sec) == "table" and type(sec.Toggle) == "function" then return sec end
-    pcall(function() tab:Section({ Title = title }) end)
-    return tab
-end
-local Box = {}
-
--- Angka pakai Slider; kalau gagal, pakai kotak input
-local function addNumber(tab, o)
-    local ok = pcall(function()
-        tab:Slider({
-            Title = o.Title,
-            Desc = o.Desc,
-            Step = o.Step or 1,
-            Value = { Min = o.Min, Max = o.Max, Default = o.Default },
-            Callback = function(v)
-                v = tonumber(v)
-                if v then o.Callback(v) end
-            end,
-        })
-    end)
-    if ok then return end
-    safe(function()
-        tab:Input({
-            Title = o.Title,
-            Desc = (o.Desc and (o.Desc .. " ") or "") .. "(" .. o.Min .. "-" .. o.Max .. ")",
-            Value = tostring(o.Default),
-            Placeholder = tostring(o.Default),
-            Callback = function(text)
-                local v = tonumber(text)
-                if v then o.Callback(math.clamp(v, o.Min, o.Max)) end
-            end,
-        })
-    end)
-end
-
--- ===== TAB: FARM =====
-local FarmTab = makeTab("Farm", "pickaxe", "farm")
-
-safe(function()
-    UI.Status = FarmTab:Paragraph({ Title = "Status", Desc = "-" })
-end)
-
-Box.FarmCtl = box(FarmTab, "Kontrol", true)
-Box.FarmBlock = box(FarmTab, "Block", true)
-Box.FarmSpeed = box(FarmTab, "Mode & Kecepatan", false)
-
-safe(function()
-    UI.FarmToggle = Box.FarmCtl:Toggle({
-        Title = "Auto Farm",
-        Desc = "Bisa juga lewat tombol START di Grid",
-        Value = false,
-        Callback = function(on)
-            if on then startFarm() elseif State.Running then stopFarm() end
-        end,
-    })
-end)
-
-safe(function()
-    Box.FarmCtl:Toggle({
-        Title = "Auto Collect",
-        Desc = "Ambil drop di semua tile grid (caranya ikut Mode collect)",
-        Value = State.AutoCollect,
-        Callback = function(on) State.AutoCollect = on end,
-    })
-end)
-
-safe(function()
-    Box.FarmCtl:Dropdown({
-        Title = "Mode collect",
-        Desc = "Berlaku untuk semua fitur. Sentuhan = seperti main manual. Remote = ambil dari jauh (cara lama, cepat)",
-        Values = { "Sentuhan", "Remote" },
-        Value = State.CollectMode,
-        Callback = function(v)
-            if type(v) == "table" then v = v[1] end
-            if v == "Sentuhan" or v == "Remote" then State.CollectMode = v end
-        end,
-    })
-end)
-
-safe(function()
-    Box.FarmCtl:Toggle({
-        Title = "Collect di sekitar karakter",
-        Desc = "Mode Remote: ambil dalam radius meski Auto Farm mati atau Grid kosong",
-        Value = State.CollectAround,
-        Callback = function(on) State.CollectAround = on end,
-    })
-end)
-
-addNumber(Box.FarmCtl, {
-    Title = "Radius collect (mode Remote)",
-    Desc = "Jarak ambil drop di sekitar karakter (tile)",
-    Min = 1, Max = 5, Step = 1, Default = State.CollectRadius,
-    Callback = function(v) State.CollectRadius = math.floor(v) end,
-})
-
-
-safe(function()
-    Box.FarmCtl:Button({
-        Title = "Buka Grid Tile",
-        Desc = "Kotak 5x5, tengah = karakter",
-        Callback = function() GridGui.Enabled = true end,
-    })
-end)
-
--- ===== TAB: CLEAR WORLD =====
-local ClearTab = makeTab("Clear World", "eraser", "farm")
-
-safe(function()
-    UI.ClearStatus = ClearTab:Paragraph({ Title = "Status Clear", Desc = "-" })
-end)
-
-Box.ClearCtl = box(ClearTab, "Kontrol", true)
-Box.ClearSet = box(ClearTab, "Pengaturan", false)
-
-safe(function()
-    UI.ClearToggle = Box.ClearCtl:Toggle({
-        Title = "Auto Clear World",
-        Desc = "Bersihkan dari baris atas ke bawah",
-        Value = false,
-        Callback = function(on)
-            if on then Auto.startClear() elseif Clear.Running then stopClear() end
-        end,
-    })
-end)
-
-safe(function()
-    Box.ClearSet:Dropdown({
-        Title = "Arah sapu",
-        Desc = "Zig-zag lebih cepat (tidak balik ke kiri)",
-        Values = { "Kiri → Kanan", "Zig-zag" },
-        Value = Clear.Sweep,
-        Callback = function(opt) Clear.Sweep = opt end,
-    })
-end)
-
-safe(function()
-    Box.ClearSet:Toggle({
-        Title = "Pakai block pijakan",
-        Desc = "Taruh block untuk lewat jurang / naik ke block melayang",
-        Value = Clear.UseBlock,
-        Callback = function(on)
-            Clear.UseBlock = on
-            Auto.resetReach()
-        end,
-    })
-end)
-
-safe(function()
-    UI.ClearBlockDropdown = Box.ClearSet:Dropdown({
-        Title = "Block pijakan",
-        Desc = "Block yang dipakai untuk pijakan",
-        Values = { "(memuat...)" },
-        Callback = function(opt)
-            local id = tonumber(string.match(opt or "", "%[(%d+)%]$"))
-            if id then
-                Clear.ScaffoldId = id
-                Auto.resetReach()
-            end
-        end,
-    })
-end)
-
-safe(function()
-    Box.ClearSet:Toggle({
-        Title = "Auto collect tiap habis pecah",
-        Desc = "Drop di sekitar disusuri sampai tersentuh badan (tanpa remote)",
-        Value = Clear.Collect,
-        Callback = function(on) Clear.Collect = on end,
-    })
-end)
-
-safe(function()
-    Box.ClearCtl:Button({
-        Title = "Reset tile yang dilewati",
-        Desc = "Coba lagi tile yang tadi gagal",
-        Callback = function()
-            table.clear(Clear.Skip)
-            table.clear(Auto.BadEdge)
-            table.clear(Auto.ClearFail)
-            Auto.updateClearStatus()
-        end,
-    })
-end)
-
--- ===== TAB: FARMER =====
-local FarmerTab = makeTab("Farmer", "leaf", "farm")
-
-safe(function()
-    UI.FarmerStatus = FarmerTab:Paragraph({ Title = "Status Farmer", Desc = "-" })
-end)
-
-Box.FarmerCtl = box(FarmerTab, "Kontrol", true)
-Box.FarmerSeed = box(FarmerTab, "Seed", true)
-Box.FarmerSpeed = box(FarmerTab, "Kecepatan", false)
-Box.FarmerBlock = box(FarmerTab, "Block pijakan", false)
-
-safe(function()
-    UI.FarmerToggle = Box.FarmerCtl:Toggle({
-        Title = "Jalankan Farmer",
-        Desc = "Panen pohon siap & tanam seed otomatis",
-        Value = false,
-        Callback = function(on)
-            if on then Auto.startFarmer() elseif Farmer.Running then stopFarmer() end
-        end,
-    })
-end)
-
-safe(function()
-    UI.SeedDropdown = Box.FarmerSeed:Dropdown({
-        Title = "Seed untuk ditanam",
-        Desc = "Hanya seed yang ada di inventori",
-        Values = { "(memuat...)" },
-        Callback = function(opt)
-            local id = tonumber(string.match(opt or "", "%[(%d+)%]$"))
-            if id then
-                Farmer.SeedId = id
-                table.clear(Farmer.Skip)
-                Auto.updateFarmerStatus()
-            end
-        end,
-    })
-end)
-
-safe(function()
-    Box.FarmerSeed:Button({
-        Title = "Refresh daftar seed",
-        Callback = function() UI.later("invForce", function() UI.checkInventory(true) end) end,
-    })
-end)
-
-safe(function()
-    Box.FarmerCtl:Toggle({
-        Title = "Auto Harvest",
-        Desc = "Hanya pohon yang sudah siap",
-        Value = Farmer.Harvest,
-        Callback = function(on) Farmer.Harvest = on end,
-    })
-end)
-
-safe(function()
-    Box.FarmerCtl:Toggle({
-        Title = "Auto Plant",
-        Desc = "Tanam di atas block yang kosong",
-        Value = Farmer.Plant,
-        Callback = function(on) Farmer.Plant = on end,
-    })
-end)
-
-safe(function()
-    Box.FarmerCtl:Toggle({
-        Title = "Auto Collect",
-        Desc = "Ambil hasil panen di sekitar karakter",
-        Value = Farmer.Collect,
-        Callback = function(on) Farmer.Collect = on end,
-    })
-end)
-
-addNumber(Box.FarmerSpeed, {
-    Title = "Speed Harvest (ms)",
-    Desc = "Jeda setelah tiap panen",
-    Min = 140, Max = 2000, Step = 10, Default = Farmer.HarvestMs,
-    Callback = function(v) Farmer.HarvestMs = math.floor(v) end,
-})
-
-addNumber(Box.FarmerSpeed, {
-    Title = "Speed Plant (ms)",
-    Desc = "Jeda setelah tiap tanam seed",
-    Min = 140, Max = 2000, Step = 10, Default = Farmer.PlantMs,
-    Callback = function(v) Farmer.PlantMs = math.floor(v) end,
-})
-
-safe(function()
-    Box.FarmerBlock:Toggle({
-        Title = "Pakai block pijakan",
-        Desc = "Taruh block kalau tidak ada jalan (block tetap tertinggal)",
-        Value = Farmer.UseBlock,
-        Callback = function(on)
-            Farmer.UseBlock = on
-            Auto.resetReach()
-        end,
-    })
-end)
-
-safe(function()
-    UI.FarmerBlockDropdown = Box.FarmerBlock:Dropdown({
-        Title = "Block pijakan",
-        Desc = "Block yang dipakai untuk pijakan",
-        Values = { "(memuat...)" },
-        Callback = function(opt)
-            local id = tonumber(string.match(opt or "", "%[(%d+)%]$"))
-            if id then
-                Farmer.ScaffoldId = id
-                Auto.resetReach()
-            end
-        end,
-    })
-end)
-
--- ===== FARM: MODE & KECEPATAN =====
-local SpeedTab = Box.FarmSpeed -- digabung ke tab Farm
-
-safe(function()
-    SpeedTab:Dropdown({
-        Title = "Mode",
-        Desc = "Place semua tile dulu, lalu break",
-        Values = { "Place + Break", "Break saja", "Place saja" },
-        Value = State.Mode,
-        Callback = function(opt) State.Mode = opt end,
-    })
-end)
-
-addNumber(SpeedTab, {
-    Title = "Speed Place (ms)",
-    Desc = "Jeda setelah tiap place",
-    Min = 140, Max = 1000, Step = 10, Default = State.PlaceMs,
-    Callback = function(v) State.PlaceMs = math.floor(v) end,
-})
-
-addNumber(SpeedTab, {
-    Title = "Speed Break (ms)",
-    Desc = "Jeda tiap pukulan (normal 220). Dipakai juga Clear",
-    Min = 200, Max = 1000, Step = 10, Default = State.BreakMs,
-    Callback = function(v) State.BreakMs = math.floor(v) end,
-})
-
-addNumber(SpeedTab, {
-    Title = "Multi target break",
-    Desc = "Auto Farm: tile dipukul bergantian (seperti 2 jari). Pakai Rayman's Fist = 2-3 tile segaris sekali pukul",
-    Min = 1, Max = 5, Step = 1, Default = State.MultiTarget,
-    Callback = function(v) State.MultiTarget = math.clamp(math.floor(v), 1, 5) end,
-})
-
-addNumber(SpeedTab, {
-    Title = "Jeda setelah hancur (ms)",
-    Desc = "Tunggu sebelum lanjut ke tile berikutnya",
-    Min = 0, Max = 1500, Step = 50, Default = State.AfterBreakMs,
-    Callback = function(v) State.AfterBreakMs = math.floor(v) end,
-})
-
--- ===== TAB: PENGATURAN (Opsi + Misc digabung) =====
-local SetTab = makeTab("Pengaturan", "sliders-horizontal", "setel")
-Box.SetChar = box(SetTab, "Karakter", true)
-Box.SetOpt = box(SetTab, "Opsi", true)
-local OptTab = Box.SetOpt
-
-safe(function()
-    OptTab:Toggle({
-        Title = "Mode Lite",
-        Desc = "Matikan particle & suara (HP low-end)",
-        Value = State.LiteMode,
-        Callback = function(on) setLite(on) end,
-    })
-end)
-
-safe(function()
-    OptTab:Toggle({
-        Title = "Mute suara pukulan",
-        Value = State.MutePunch,
-        Callback = function(on) State.MutePunch = on end,
-    })
-end)
-
-safe(function()
-    OptTab:Toggle({
-        Title = "Animasi aksi",
-        Desc = "Tangan bergerak saat break / place / tanam / panen + efek place. Matikan untuk hemat FPS",
-        Value = State.Visual,
-        Callback = function(on)
-            State.Visual = on
-            if on and not Anim.fn and Refs.World then
-                notify("Animasi", "Fungsi animasi game tidak ketemu (tekan 'Hubungkan ke game')", 4)
-            end
-        end,
-    })
-end)
-
-safe(function()
-    OptTab:Toggle({
-        Title = "Anti AFK",
-        Value = State.AntiAfk,
-        Callback = function(on) State.AntiAfk = on end,
-    })
-end)
-
-addNumber(OptTab, {
-    Title = "Pukulan per block (cadangan)",
-    Desc = "Dipakai kalau 'Pukul: TIDAK'. 0 = otomatis",
-    Min = 0, Max = 20, Step = 1, Default = State.HitsOverride,
-    Callback = function(v) State.HitsOverride = math.floor(v) end,
-})
-
--- ===== FARM: PILIH BLOCK =====
-local InvTab = Box.FarmBlock -- digabung ke tab Farm
-
-safe(function()
-    UI.InvDropdown = InvTab:Dropdown({
-        Title = "Pilih Block",
-        Desc = "Hanya item yang bisa di-place",
-        Values = { "(memuat...)" },
-        Callback = function(opt)
-            local id = tonumber(string.match(opt or "", "%[(%d+)%]$"))
-            if id then
-                State.SelectedId = id
-                updateStatus()
-            end
-        end,
-    })
-end)
-
-safe(function()
-    InvTab:Button({
-        Title = "Refresh daftar",
-        Callback = function() UI.later("invForce", function() UI.checkInventory(true) end) end,
-    })
-end)
-
--- ===== PENGATURAN: KARAKTER =====
-local MiscTab = Box.SetChar
-
-addNumber(MiscTab, {
-    Title = "Walkspeed (%)",
-    Desc = "100 = normal",
-    Min = 50, Max = 500, Step = 10, Default = Misc.Speed,
-    Callback = function(v) setSpeed(v) end,
-})
-
-safe(function()
-    MiscTab:Toggle({
-        Title = "Infinite Jump",
-        Desc = "Lompat di udara (bisa kena rollback)",
-        Value = false,
-        Callback = function(on) setInfJump(on) end,
-    })
-end)
-
-safe(function()
-    UI.GhostToggle = MiscTab:Toggle({
-        Title = "Fly + Tembus Block",
-        Desc = "Tembus block, pakai tombol ▲/▼ (bisa kena rollback)",
-        Value = false,
-        Callback = function(on) setGhost(on) end,
-    })
-end)
-
--- ===== TAB: TELEPORT =====
-do (function()
-    local TP = Auto.Teleport
-    local tab = makeTab("Teleport", "map-pin", "fitur")
-    safe(function()
-        UI.TeleportStatus = tab:Paragraph({ Title = "Status Teleport", Desc = TP.text() })
-    end)
-    local ctl = box(tab, "Tujuan tile di world ini", true)
-    safe(function()
-        UI.TeleportX = ctl:Input({
-            Title = "Koordinat X", Desc = "Kolom tile, mengikuti koordinat pada Status", Value = TP.X, Placeholder = "contoh: 10",
-            Callback = function(text) TP.X = tostring(text or "") end,
-        })
-    end)
-    safe(function()
-        UI.TeleportY = ctl:Input({
-            Title = "Koordinat Y", Desc = "Baris tile, mengikuti koordinat pada Status", Value = TP.Y, Placeholder = "contoh: 20",
-            Callback = function(text) TP.Y = tostring(text or "") end,
-        })
-    end)
-    safe(function()
-        ctl:Button({
-            Title = "Gunakan posisi sekarang",
-            Callback = function()
-                UI.later("teleportCapture", function()
-                    local ok, why = TP.capture()
-                    if not ok then notify("Teleport", why, 5); return end
-                    if UI.TeleportX then UI.TeleportX:Set(TP.X) end
-                    if UI.TeleportY then UI.TeleportY:Set(TP.Y) end
-                end)
-            end,
-        })
-    end)
-    safe(function()
-        ctl:Button({
-            Title = "Teleport ke koordinat",
-            Desc = "Jeda Auto Farm / gerak dulu. Pilih tile kosong; posisi diperiksa setelah dipindahkan.",
-            Callback = function()
-                UI.later("teleportRun", function()
-                    local ok, why = TP.run()
-                    notify("Teleport", why, ok and 4 or 6)
-                end)
-            end,
-        })
-    end)
-end)() end
-
--- ===== TAB: AUTO CHAT =====
-local ChatTab = makeTab("Auto Chat", "message-circle", "fitur")
-
-safe(function()
-    UI.SpamStatus = ChatTab:Paragraph({ Title = "Status Chat", Desc = "-" })
-end)
-
-Box.ChatCtl = box(ChatTab, "Kontrol", true)
-Box.ChatMsg = box(ChatTab, "Pesan", true)
-
-safe(function()
-    Box.ChatMsg:Input({
-        Title = "Daftar pesan",
-        Desc = "Pisahkan dengan |   contoh: halo|jual dirt",
-        Value = table.concat(Spam.Texts, "|"),
-        Placeholder = "pesan 1|pesan 2|pesan 3",
-        Callback = function(text)
-            Spam.Texts = parseSpamTexts(text)
-            Spam.Index = 1
-            updateSpamStatus()
-        end,
-    })
-end)
-
-addNumber(Box.ChatMsg, {
-    Title = "Interval (detik)",
-    Desc = "Jeda antar pesan (min 3 detik)",
-    Min = 3, Max = 120, Step = 1, Default = Spam.IntervalSec,
-    Callback = function(v) Spam.IntervalSec = math.max(3, math.floor(v)) end,
-})
-
-safe(function()
-    UI.SpamToggle = Box.ChatCtl:Toggle({
-        Title = "Auto Chat",
-        Desc = "Kirim pesan bergantian sesuai urutan",
-        Value = false,
-        Callback = function(on)
-            Spam.On = on
-            if on then
-                if #Spam.Texts == 0 then notify("Auto Chat", "Isi daftar pesan dulu (tekan Enter setelah mengetik)", 4) end
-                Spam.NextAt = 0 -- langsung kirim pesan pertama
-            end
-            updateSpamStatus()
-        end,
-    })
-end)
-
-safe(function()
-    Box.ChatCtl:Button({
-        Title = "Kirim 1 pesan sekarang",
-        Desc = "Tes kirim pesan berikutnya",
-        Callback = function()
-            task.spawn(function()
-                sendNextChat()
-                updateSpamStatus()
-            end)
-        end,
-    })
-end)
-
----------------------------------------------------------------------
--- PENJAGA: deteksi Mod / Dev / pemain yang masuk world
----------------------------------------------------------------------
--- Cara kerja:
---   1. Tiap 0.5 detik baca daftar pemain di world (data game "Others").
---   2. Role dicek pakai modul Roles game (Developer / Moderator, undercover juga ketahuan).
---   3. Ada yang dicari -> semua aktivitas dihentikan, bisa juga langsung keluar world.
---   4. Setelah aman -> aktivitas sebelumnya dilanjutkan.
---      Mode keluar: tunggu X detik, masuk world lagi, cek lagi.
---      Masih ada orangnya -> keluar lagi. Sudah aman -> lanjut (Auto Farm jalan balik ke posisi awal).
-
-do (function() -- fungsi sendiri: variabel di dalam tidak ikut batas 200 local
-    local function strip(s) return (tostring(s or ""):gsub("`.", "")) end
-
-    local function roleOf(uid)
-        if not (RolesOk and type(RolesModule) == "table") then return nil end
-        local okD, dev = pcall(RolesModule.isDeveloper, uid)
-        if okD and dev then return "Developer" end
-        local okM, mod = pcall(RolesModule.isModerator, uid)
-        if okM and mod then return "Moderator" end
-        return nil
-    end
-
-    local function worldName()
-        local n = Refs.World and rawget(Refs.World, "name")
-        return type(n) == "string" and n or ""
-    end
-
-    -- Pemain lain di world ini: { id, name, role }
-    local function playersHere()
-        local out = {}
-        local o = Refs.Others
-        if not o or type(rawget(o, "list")) ~= "function" then return out end
-        local ok, list = pcall(o.list)
-        if not ok or type(list) ~= "table" then return out end
-        for _, e in ipairs(list) do
-            local uid = type(e) == "table" and tonumber(e[1] or e.userId)
-            if uid and uid ~= LocalPlayer.UserId then
-                out[#out + 1] = { id = uid, name = strip(e[2] or e.name or uid), role = roleOf(uid) }
-            end
-        end
-        return out
-    end
-    Guard.playersHere = playersHere
-
-    local function threatsOf(list)
-        local out = {}
-        for _, p in ipairs(list) do
-            if p.role or (Guard.Who == "Semua pemain" and not Guard.Allow[p.id]) then
-                out[#out + 1] = p
-            end
-        end
-        return out
-    end
-
-    local function label(p)
-        local under = false
-        if p.role and type(RolesModule.isUndercover) == "function" then
-            local ok, u = pcall(RolesModule.isUndercover, p.id)
-            under = ok and u == true
-        end
-        return p.name .. " (" .. (p.role or "Pemain") .. (under and ", undercover" or "") .. ")"
-    end
-
-    local function names(list, max)
-        local t = {}
-        for i, p in ipairs(list) do
-            if i > (max or 4) then
-                t[#t + 1] = "+" .. (#list - i + 1) .. " lagi"
-                break
-            end
-            t[#t + 1] = label(p)
-        end
-        return table.concat(t, ", ")
-    end
-
-    local function anyRunning()
-        return State.Running or Clear.Running or Farmer.Running or Splice.Running or Spam.On
-            or Pabrik.Running or Build.Running
-    end
-
-    -- Catat aktivitas yang sedang jalan (untuk dilanjutkan nanti)
-    local function snapshot()
-        local tx, ty = Auto.here()
-        return {
-            farm = State.Running and not State.Override, clear = Clear.Running, farmer = Farmer.Running,
-            spam = Spam.On, splice = Splice.Running, pabrik = Pabrik.Running, build = Build.Running,
-            world = worldName(), tx = tx, ty = ty,
-        }
-    end
-
-    local function stopAll()
-        Auto.stopWalk()
-        if Pabrik.Running then Pabrik.stop() end
-        if Build.Running then Build.stop() end
-        if State.Running then stopFarm() end
-        if Clear.Running then
-            stopClear()
-            Clear.Status = "Dijeda Penjaga"
-        end
-        if Farmer.Running then
-            stopFarmer()
-            Farmer.Status = "Dijeda Penjaga"
-        end
-        if Splice.Running and Splice.stop then Splice.stop() end
-        if Vend.Running and Vend.stop then Vend.stop() end
-        if Spam.On then
-            Spam.On = false
-            if UI.SpamToggle then pcall(function() UI.SpamToggle:Set(false) end) end
-        end
-        Auto.releaseInput()
-    end
-
-    -- Keluar world = sama seperti tombol "Exit World" game
-    local function leaveWorld()
-        local m = Refs.Menu
-        if m and type(rawget(m, "openPicker")) == "function" and pcall(m.openPicker) then
-            return true
-        end
-        local w = Refs.World
-        if w and type(rawget(w, "call")) == "function" then
-            return (pcall(w.call, "LeaveWorld"))
-        end
-        return false
-    end
-
-    -- Masuk world lewat menu game (sama seperti ketik nama world lalu Enter)
-    local function enterWorld(name)
-        local w = Refs.World
-        if not w or name == "" then return false, "nama world tidak diketahui" end
-        local oldFg = rawget(w, "fg")
-        local m = Refs.Menu
-        if m and type(rawget(m, "enter")) == "function" then
-            pcall(m.enter, name)
-        elseif type(rawget(w, "enter")) == "function" then
-            local ok, res, msg = pcall(w.enter, name)
-            if ok and not res then return false, strip(msg) end
-        else
-            return false, "fungsi masuk world tidak ketemu"
-        end
-        -- berhasil kalau data world sudah diganti yang baru
-        local t0 = os.clock()
-        while alive() and os.clock() - t0 < 8 do
-            if rawget(w, "fg") ~= oldFg then return true end
-            task.wait(0.25)
-        end
-        return false, "world penuh / dikunci / gagal"
-    end
-
-    local function stillBack(token)
-        return alive() and Guard.Token == token and Guard.Mode == "back"
-    end
-
-    -- Lanjutkan aktivitas yang tadi dihentikan
-    local function resumeAll(saved, token)
-        if not saved then return end
-        if saved.world ~= "" and worldName() ~= saved.world then
-            notify("Penjaga", "World sudah beda, aktivitas tidak dilanjutkan", 5)
-            return
-        end
-        if saved.spam and not Spam.On and stillBack(token) then
-            if UI.SpamToggle then pcall(function() UI.SpamToggle:Set(true) end) end
-            Spam.On = true
-        end
-        if saved.build then
-            if stillBack(token) then Build.start() end
-        elseif saved.pabrik then
-            if stillBack(token) then Pabrik.start() end
-        elseif saved.farm then
-            -- Auto Farm memakai tile di sekitar karakter, jadi harus balik ke posisi awal
-            local hx, hy = Auto.here()
-            if saved.tx and (hx ~= saved.tx or hy ~= saved.ty) then
-                Guard.BackText = ("Jalan balik ke posisi farm (%d,%d)"):format(saved.tx, saved.ty)
-                local ok = Auto.walkTo(saved.tx, saved.ty, 45)
-                if not ok and stillBack(token) then ok = Auto.walkTo(saved.tx, saved.ty, 30) end
-                if not ok then
-                    if stillBack(token) then
-                        notify("Penjaga", "Gagal balik ke posisi farm. Auto Farm tidak dilanjutkan", 6)
-                    end
-                    return
-                end
-            end
-            if stillBack(token) then startFarm() end
-        elseif saved.clear then
-            if stillBack(token) then Auto.startClear() end
-        elseif saved.farmer then
-            if stillBack(token) then Auto.startFarmer() end
-        elseif saved.splice then
-            if stillBack(token) and Splice.start then Splice.start() end
-        end
-    end
-
-    local function beginResume()
-        local saved = Guard.Saved
-        Guard.Token += 1
-        local token = Guard.Token
-        Guard.Mode = "back"
-        Guard.BackText = nil
-        task.spawn(function()
-            local ok, err = pcall(resumeAll, saved, token)
-            if not ok then warn("[Zekio supreme] Penjaga lanjut error: " .. tostring(err)) end
-            if Guard.Token == token and Guard.Mode == "back" then
-                Guard.Mode, Guard.Saved, Guard.BackText = "idle", nil, nil
-            end
-        end)
-    end
-
-    local function goAway()
-        if not leaveWorld() then
-            notify("Penjaga", "Gagal keluar world, aktivitas hanya dijeda", 5)
-            Guard.Mode = "pause"
-            return
-        end
-        task.wait(0.3)
-        Guard.LeftFg = Refs.World and rawget(Refs.World, "fg")
-        Guard.BackAt = os.clock() + Guard.BackSec
-        Guard.Mode = Guard.AutoBack and "away" or "out"
-        Guard.Status = "Keluar world"
-    end
-
-    -- Ada orang baru yang dicari masuk world
-    local function trigger(fresh)
-        Guard.Detected += #fresh
-        notify("Penjaga", "Masuk world: " .. names(fresh), 6)
-        Hook.send("penjaga", "Masuk world " .. worldName() .. ": " .. names(fresh))
-        if not Guard.StopAll and not Guard.Leave then return end -- hanya peringatan
-        -- simpan aktivitas (kalau sedang jalan balik, pakai catatan lama)
-        if Guard.Mode ~= "back" and (anyRunning() or not Guard.Saved) then
-            Guard.Saved = snapshot()
-        end
-        Guard.Token += 1
-        stopAll()
-        Guard.CalmAt = nil
-        if Guard.Leave then
-            goAway()
-            if Guard.Mode == "away" then
-                notify("Penjaga", "Keluar world. Masuk lagi dalam " .. Guard.BackSec .. " detik", 5)
-                Hook.send("penjaga", "Keluar world, masuk lagi dalam " .. Guard.BackSec .. " detik")
-            elseif Guard.Mode == "out" then
-                notify("Penjaga", "Keluar world", 4)
-            end
-        else
-            Guard.Mode = "pause"
-        end
-    end
-
-    -- Setelah masuk world lagi: cek dulu, masih ada orangnya atau tidak
-    local function checkAfterEnter()
-        Auto.resetReach()
-        pcall(findDropRefs)
-        pcall(Auto.findTreeRefs)
-        table.clear(DropFailUntil)
-        task.wait(1.5) -- tunggu daftar pemain terisi
-        local th = threatsOf(playersHere())
-        if #th > 0 then
-            for _, p in ipairs(th) do Guard.Alerted[p.id] = true end
-            notify("Penjaga", "Masih ada " .. names(th) .. ". Keluar lagi", 5)
-            goAway()
-            return
-        end
-        notify("Penjaga", "World aman, lanjut aktivitas", 4)
-        Hook.send("penjaga", "World " .. worldName() .. " aman, lanjut aktivitas")
-        beginResume()
-    end
-
-    -- Staff yang online di server (bukan hanya di world ini)
-    local lastScan, staffText = -10, "-"
-    local function serverStaff()
-        if os.clock() - lastScan < 3 then return staffText end
-        lastScan = os.clock()
-        local t = {}
-        for _, plr in ipairs(Players:GetPlayers()) do
-            if plr ~= LocalPlayer then
-                local r = roleOf(plr.UserId)
-                if r then t[#t + 1] = (plr.DisplayName or plr.Name) .. " (" .. r .. ")" end
-            end
-        end
-        staffText = (#t > 0) and table.concat(t, ", ") or "tidak ada"
-        return staffText
-    end
-
-    function Guard.tick(here)
-        if not Guard.On then
-            Guard.Status = "Mati"
-            return
-        end
-        local now = os.clock()
-        local mode = Guard.Mode
-
-        -- ===== sedang di luar world =====
-        if mode == "away" or mode == "out" then
-            local fgNow = Refs.World and rawget(Refs.World, "fg")
-            if Guard.LeftFg and fgNow ~= Guard.LeftFg then
-                -- sudah masuk world lagi secara manual
-                if mode == "away" and Guard.Saved and worldName() == Guard.Saved.world then
-                    checkAfterEnter()
-                else
-                    Guard.Mode, Guard.Saved = "idle", nil
-                end
-                return
-            end
-            local name = Guard.Saved and Guard.Saved.world or ""
-            if mode == "out" or name == "" then
-                Guard.Status = "Sudah keluar world (lanjut otomatis mati)"
-                return
-            end
-            local left = Guard.BackAt - now
-            if left > 0 then
-                Guard.Status = ("Di luar world. Masuk lagi ke %s dalam %d detik"):format(name, math.ceil(left))
-                return
-            end
-            Guard.Status = "Masuk lagi ke " .. name .. "..."
-            Guard.updateStatus({})
-            local ok, err = enterWorld(name)
-            if not ok then
-                Guard.BackAt = os.clock() + math.max(15, Guard.BackSec)
-                notify("Penjaga", "Gagal masuk " .. name .. ": " .. tostring(err) .. ". Dicoba lagi nanti", 5)
-                return
-            end
-            checkAfterEnter()
-            return
-        end
-
-        -- ===== di dalam world =====
-        local present = {}
-        for _, p in ipairs(here) do present[p.id] = true end
-        for id in pairs(Guard.Alerted) do
-            if not present[id] then Guard.Alerted[id] = nil end -- sudah pergi
-        end
-        local threats = threatsOf(here)
-        local fresh = {}
-        for _, p in ipairs(threats) do
-            if not Guard.Alerted[p.id] then
-                Guard.Alerted[p.id] = true
-                fresh[#fresh + 1] = p
-            end
-        end
-        if #fresh > 0 then
-            trigger(fresh)
-            if Guard.Mode == "away" or Guard.Mode == "out" then return end
-        end
-
-        if #threats > 0 then
-            Guard.CalmAt = nil
-            Guard.Status = (Guard.Mode == "pause" and "Dijeda. Ada: " or "Waspada. Ada: ") .. names(threats)
-            return
-        end
-
-        if Guard.Mode == "pause" then
-            Guard.CalmAt = Guard.CalmAt or now
-            local wait = Guard.CalmSec - (now - Guard.CalmAt)
-            if wait > 0 then
-                Guard.Status = ("Mereka sudah pergi. Lanjut dalam %d detik"):format(math.ceil(wait))
-                return
-            end
-            Guard.CalmAt = nil
-            if Guard.AutoBack and Guard.Saved then
-                notify("Penjaga", "Sudah aman, lanjut aktivitas", 4)
-                beginResume()
-            else
-                Guard.Mode, Guard.Saved = "idle", nil
-            end
-            return
-        end
-
-        if Guard.Mode == "back" then
-            Guard.Status = Guard.BackText or "Lanjut aktivitas..."
-            return
-        end
-        Guard.Status = "Aman"
-    end
-
-    function Guard.updateStatus(here)
-        local txt = table.concat({
-            "Status: " .. Guard.Status .. (Refs.Others and "" or " (data pemain belum ketemu: tekan 'Hubungkan ke game')"),
-            "Pemain di world: " .. ((#here == 0) and "tidak ada" or names(here, 6)),
-            "Staff online di server: " .. serverStaff(),
-            "Terdeteksi: " .. Guard.Detected .. " kali",
-        }, "\n")
-        if txt ~= Guard.LastTxt then
-            Guard.LastTxt = txt
-            if UI.GuardStatus then pcall(function() UI.GuardStatus:SetDesc(txt) end) end
-        end
-    end
-
-    -- Nyalakan / matikan Penjaga
-    function Guard.set(on)
-        Guard.On = on
-        Guard.Token += 1
-        Auto.stopWalk()
-        Guard.Mode, Guard.Saved, Guard.CalmAt, Guard.BackText = "idle", nil, nil, nil
-        table.clear(Guard.Alerted)
-        table.clear(Guard.Allow)
-        if on then
-            -- pemain biasa yang sudah ada sekarang diabaikan (teman / akun sendiri)
-            for _, p in ipairs(playersHere()) do
-                if not p.role then Guard.Allow[p.id] = true end
-            end
-        end
-    end
-
-    -- dipakai fitur lain (Auto Reconnect)
-    Guard.snapshot = snapshot
-    Guard.stopAll = stopAll
-    Guard.enterWorld = enterWorld
-    Guard.leaveWorld = leaveWorld
-    Guard.worldName = worldName
-    Guard.anyRunning = anyRunning
-    function Guard.afterEnter()
-        Auto.resetReach()
-        pcall(findDropRefs)
-        pcall(Auto.findTreeRefs)
-        table.clear(DropFailUntil)
-    end
-    function Guard.resumeSaved(saved)
-        Guard.Saved = saved
-        beginResume()
-    end
-
-    function Guard.allowNow()
-        local n = 0
-        for _, p in ipairs(playersHere()) do
-            if not p.role then
-                Guard.Allow[p.id] = true
-                n += 1
-            end
-        end
-        return n
-    end
-
-    task.spawn(function()
-        while alive() do
-            local here = (Guard.Mode ~= "away" and Guard.Mode ~= "out") and playersHere() or {}
-            local ok, err = pcall(Guard.tick, here)
-            if not ok then warn("[Zekio supreme] Penjaga error: " .. tostring(err)) end
-            Guard.updateStatus(here)
-            task.wait(0.5)
-        end
-    end)
-end)() end
-
-Config.add("Penjaga", Guard, { "On", "Who", "StopAll", "Leave", "AutoBack", "BackSec", "CalmSec" }, { On = true })
-
--- ===== TAB: PENJAGA =====
-do (function() -- fungsi sendiri: variabel di dalam tidak ikut batas 200 local
-    local GuardTab = makeTab("Penjaga", "eye", "aman")
-
-    safe(function()
-        UI.GuardStatus = GuardTab:Paragraph({ Title = "Status Penjaga", Desc = "Mati" })
-    end)
-
-    local gCtl = box(GuardTab, "Kontrol", true)
-    local gAct = box(GuardTab, "Aksi saat terdeteksi", true)
-    local gTime = box(GuardTab, "Waktu", false)
-    local gMore = box(GuardTab, "Lainnya", false)
-
-    safe(function()
-        UI.GuardToggle = gCtl:Toggle({
-            Title = "Aktifkan Penjaga",
-            Desc = "Pantau Mod / Dev / pemain yang masuk world",
-            Value = false,
-            Callback = function(on) Guard.set(on) end,
-        })
-    end)
-
-    safe(function()
-        gCtl:Dropdown({
-            Title = "Yang dideteksi",
-            Desc = "Semua pemain: yang sudah ada saat dinyalakan diabaikan",
-            Values = { "Staff (Mod/Dev)", "Semua pemain" },
-            Value = Guard.Who,
-            Callback = function(opt) Guard.Who = opt end,
-        })
-    end)
-
-    safe(function()
-        gAct:Toggle({
-            Title = "Diam semua aktivitas",
-            Desc = "Stop Auto Farm, Clear, Farmer & Auto Chat",
-            Value = Guard.StopAll,
-            Callback = function(on) Guard.StopAll = on end,
-        })
-    end)
-
-    safe(function()
-        gAct:Toggle({
-            Title = "Keluar world",
-            Desc = "Langsung keluar world saat terdeteksi",
-            Value = Guard.Leave,
-            Callback = function(on) Guard.Leave = on end,
-        })
-    end)
-
-    safe(function()
-        gAct:Toggle({
-            Title = "Lanjut otomatis setelah aman",
-            Desc = "Keluar world: masuk lagi, cek, lalu lanjut aktivitas sebelumnya",
-            Value = Guard.AutoBack,
-            Callback = function(on) Guard.AutoBack = on end,
-        })
-    end)
-
-    addNumber(gTime, {
-        Title = "Masuk world lagi setelah (detik)",
-        Desc = "Untuk mode keluar world",
-        Min = 20, Max = 600, Step = 5, Default = Guard.BackSec,
-        Callback = function(v) Guard.BackSec = math.floor(v) end,
-    })
-
-    addNumber(gTime, {
-        Title = "Tunggu aman (detik)",
-        Desc = "Untuk mode diam: jeda setelah mereka pergi",
-        Min = 2, Max = 60, Step = 1, Default = Guard.CalmSec,
-        Callback = function(v) Guard.CalmSec = math.floor(v) end,
-    })
-
-    safe(function()
-        gMore:Button({
-            Title = "Abaikan pemain yang ada sekarang",
-            Desc = "Untuk teman / akun sendiri (staff tetap dideteksi)",
-            Callback = function()
-                notify("Penjaga", Guard.allowNow() .. " pemain diabaikan", 3)
-            end,
-        })
-    end)
-
-    safe(function()
-        gMore:Button({
-            Title = "Batalkan tunggu / lanjut",
-            Desc = "Hentikan proses keluar-masuk & lanjut otomatis",
-            Callback = function()
-                Guard.set(Guard.On)
-                notify("Penjaga", "Dibatalkan", 3)
-            end,
-        })
-    end)
-end)() end
-
----------------------------------------------------------------------
--- BONUS: auto klaim quest & auto redeem code
----------------------------------------------------------------------
--- Pakai panggilan yang sama dengan menu Quest & Redeem game:
---   Net.call("Quests", "list")            -> daftar quest hari ini
---   Net.call("Quests", "claim", id)       -> klaim hadiah (server yang cek syaratnya)
---   Net.call("ActiveCodes")               -> daftar code aktif
---   Net.call("ModCommand", "redeemcode", code) -> tukar code (dipakai menu Redeem game)
-local Bonus = {
-    Quest = false,
-    Redeem = false,
-    QuestEvery = 30,   -- cek quest tiap 30 detik
-    CodeEvery = 300,   -- cek code tiap 5 menit
-    NextQuest = 0,
-    NextCode = 0,
-    Claimed = 0,
-    Redeemed = 0,
-    Tried = {},        -- code yang sudah dicoba
-    QuestFail = {},    -- quest yang ditolak server (dicoba lagi nanti)
-    QuestText = "-",
-    CodeText = "-",
-    ResetAt = nil,
-}
-
-do (function() -- fungsi sendiri: variabel di dalam tidak ikut batas 200 local
-    local function strip(s) return (tostring(s or ""):gsub("`.", "")) end
-
-    local function netCall(...)
-        if NetOk and type(Net) == "table" and type(Net.call) == "function" then
-            return pcall(Net.call, ...)
-        end
-        return false, "Net.call tidak ada"
-    end
-
-    local function timeText(sec)
-        sec = math.max(0, math.floor(sec or 0))
-        if sec >= 3600 then return ("%dj %dm"):format(sec // 3600, sec % 3600 // 60) end
-        return ("%dm %dd"):format(sec // 60, sec % 60)
-    end
-
-    local function setGems(n)
-        local g = Refs.Gems
-        if type(n) == "number" and g and type(rawget(g, "setGems")) == "function" then
-            pcall(g.setGems, n)
-        end
-    end
-
-    function Bonus.checkQuests()
-        if Bonus.BusyQ then return end
-        Bonus.BusyQ = true
-        local ok, good, data = netCall("Quests", "list")
-        if not ok then
-            Bonus.QuestText = "Gagal ambil quest: " .. strip(good)
-        elseif not good or type(data) ~= "table" or type(data.quests) ~= "table" then
-            Bonus.QuestText = "Quest belum bisa diambil" .. (type(data) == "string" and (": " .. strip(data)) or "")
-        else
-            local total, done, wait = 0, 0, 0
-            local now = os.clock()
-            for _, q in ipairs(data.quests) do
-                total += 1
-                local have, need = tonumber(q.have) or 0, tonumber(q.need) or math.huge
-                if q.claimed then
-                    done += 1
-                elseif have >= need and not ((Bonus.QuestFail[q.id] or 0) > now) then
-                    -- syarat sama seperti tombol Claim game
-                    local okc, success, msg, _, gems = netCall("Quests", "claim", q.id)
-                    if okc and success then
-                        done += 1
-                        Bonus.Claimed += 1
-                        local reward = q.xp and (tostring(q.reward) .. " XP") or (tostring(q.reward) .. " gems")
-                        notify("Quest diklaim", strip(q.text or q.id) .. "  +" .. reward, 4)
-                        Hook.send("bonus", "Quest diklaim: " .. strip(q.text or q.id) .. " +" .. reward)
-                        setGems(gems)
-                    else
-                        wait += 1
-                        Bonus.QuestFail[q.id] = now + 120
-                        if okc and msg then Bonus.LastQuestMsg = strip(msg) end
-                    end
-                    task.wait(0.6)
-                elseif have >= need then
-                    wait += 1
-                end
-            end
-            Bonus.ResetAt = os.clock() + (tonumber(data.resetIn) or 0)
-            Bonus.QuestText = ("Selesai %d/%d | diklaim script: %d"):format(done, total, Bonus.Claimed)
-                .. ((wait > 0) and (" | ditolak: " .. wait) or "")
-        end
-        Bonus.BusyQ = false
-    end
-
-    -- Tukar 1 code. Berhasil kalau balasan server diawali warna hijau (`2)
-    function Bonus.redeem(code)
-        local ok, res = netCall("ModCommand", "redeemcode", code)
-        if not ok then return nil, "tidak bisa ke server" end
-        local lines = type(res) == "table" and type(res.lines) == "table" and res.lines or nil
-        if not lines then return false, "balasan kosong" end
-        local first = tostring(lines[1] or "")
-        local parts = {}
-        for _, l in ipairs(lines) do parts[#parts + 1] = strip(l) end
-        return string.sub(first, 1, 2) == "`2", table.concat(parts, " ")
-    end
-
-    function Bonus.checkCodes()
-        if Bonus.BusyR then return end
-        Bonus.BusyR = true
-        local ok, list = netCall("ActiveCodes")
-        if not ok or type(list) ~= "table" then
-            Bonus.CodeText = "Gagal ambil daftar code"
-        elseif list.note ~= nil then
-            Bonus.CodeText = "Redeem sedang ditutup: " .. strip(list.note)
-        else
-            local total, have, newOk = 0, 0, 0
-            for _, c in ipairs(list) do
-                total += 1
-                local code = c.code and tostring(c.code)
-                if c.done then
-                    have += 1
-                elseif code and not Bonus.Tried[code] and not (type(c.uses) == "number" and c.uses == 0) then
-                    local success, msg = Bonus.redeem(code)
-                    if success ~= nil then Bonus.Tried[code] = true end -- server sudah jawab
-                    if success then
-                        have += 1
-                        newOk += 1
-                        Bonus.Redeemed += 1
-                        notify("Redeem berhasil", code .. ": " .. tostring(msg), 5)
-                        Hook.send("bonus", "Redeem berhasil " .. code .. ": " .. tostring(msg))
-                    elseif success == false then
-                        Bonus.LastCodeMsg = code .. ": " .. tostring(msg)
-                    end
-                    task.wait(1)
-                end
-            end
-            Bonus.CodeText = ("Code aktif: %d | sudah ditukar: %d | ditukar script: %d"):format(total, have, Bonus.Redeemed)
-        end
-        Bonus.BusyR = false
-    end
-
-    function Bonus.updateStatus()
-        local now = os.clock()
-        local q = Bonus.QuestText
-        if Bonus.ResetAt then q = q .. "\nQuest baru dalam " .. timeText(Bonus.ResetAt - now) end
-        if Bonus.LastQuestMsg then q = q .. "\nPesan terakhir: " .. Bonus.LastQuestMsg end
-        q = q .. "\n" .. (Bonus.Quest and ("Cek lagi dalam " .. math.max(0, math.ceil(Bonus.NextQuest - now)) .. " detik") or "Auto klaim mati")
-        local c = Bonus.CodeText
-        if Bonus.LastCodeMsg then c = c .. "\nPesan terakhir: " .. Bonus.LastCodeMsg end
-        c = c .. "\n" .. (Bonus.Redeem and ("Cek lagi dalam " .. timeText(Bonus.NextCode - now)) or "Auto redeem mati")
-        if UI.QuestStatus then pcall(function() UI.QuestStatus:SetDesc(q) end) end
-        if UI.CodeStatus then pcall(function() UI.CodeStatus:SetDesc(c) end) end
-    end
-
-    task.spawn(function()
-        while alive() do
-            local now = os.clock()
-            if Bonus.Quest and now >= Bonus.NextQuest then
-                Bonus.NextQuest = now + Bonus.QuestEvery
-                pcall(Bonus.checkQuests)
-            end
-            if Bonus.Redeem and now >= Bonus.NextCode then
-                Bonus.NextCode = now + Bonus.CodeEvery
-                pcall(Bonus.checkCodes)
-            end
-            Bonus.updateStatus()
-            task.wait(1)
-        end
-    end)
-end)() end
-
-Config.add("Bonus", Bonus, { "Quest", "Redeem" })
-
--- ===== TAB: BONUS =====
-do (function() -- fungsi sendiri: variabel di dalam tidak ikut batas 200 local
-    local BonusTab = makeTab("Bonus", "gift", "fitur")
-    local bQuest = box(BonusTab, "Quest Harian", true)
-    local bCode = box(BonusTab, "Redeem Code", true)
-
-    safe(function()
-        UI.QuestStatus = bQuest:Paragraph({ Title = "Status", Desc = "-" })
-    end)
-
-    safe(function()
-        bQuest:Toggle({
-            Title = "Auto Claim Quest",
-            Desc = "Klaim hadiah quest yang sudah selesai",
-            Value = Bonus.Quest,
-            Callback = function(on)
-                Bonus.Quest = on
-                if on then Bonus.NextQuest = 0 end
-            end,
-        })
-    end)
-
-    safe(function()
-        bQuest:Button({
-            Title = "Cek quest sekarang",
-            Callback = function() task.spawn(Bonus.checkQuests) end,
-        })
-    end)
-
-    safe(function()
-        UI.CodeStatus = bCode:Paragraph({ Title = "Status", Desc = "-" })
-    end)
-
-    safe(function()
-        bCode:Toggle({
-            Title = "Auto Redeem Code",
-            Desc = "Tukar semua code aktif yang belum dipakai",
-            Value = Bonus.Redeem,
-            Callback = function(on)
-                Bonus.Redeem = on
-                if on then Bonus.NextCode = 0 end
-            end,
-        })
-    end)
-
-    safe(function()
-        bCode:Button({
-            Title = "Cek code sekarang",
-            Callback = function()
-                table.clear(Bonus.Tried)
-                task.spawn(Bonus.checkCodes)
-            end,
-        })
-    end)
-
-    safe(function()
-        bCode:Input({
-            Title = "Redeem code manual",
-            Desc = "Ketik code lalu tekan Enter",
-            Value = "",
-            Placeholder = "KODE",
-            Callback = function(text)
-                local code = tostring(text or ""):gsub("^%s+", ""):gsub("%s+$", "")
-                if code == "" then return end
-                task.spawn(function()
-                    local success, msg = Bonus.redeem(code)
-                    if success then Bonus.Redeemed += 1 end
-                    notify(success and "Redeem berhasil" or "Redeem gagal", code .. ": " .. tostring(msg), 5)
-                end)
-            end,
-        })
-    end)
-end)() end
-
----------------------------------------------------------------------
--- GROWSCAN: Floating Items & World Blocks (seperti Growscan 9000 di Growtopia)
----------------------------------------------------------------------
--- Cara kerja:
---   - Floating Items: daftar drop di world (data drop game), dijumlah per item.
---   - World Blocks: semua tile world dihitung per item (block depan + background).
---     Seed yang tertanam di block depan = pohon.
---   - Auto Scan: diulang tiap 2 detik. Hasil diurutkan dari jumlah terbanyak.
-local Scan = {
-    Auto = false,
-    Layer = "Semua",      -- "Semua" | "Depan" | "Background"
-    Filter = "",          -- cari nama item
-    Every = 2,
-    Limit = 60,           -- maksimal baris per daftar
-    Last = nil,
-}
-
-do (function() -- fungsi sendiri: variabel di dalam tidak ikut batas 200 local
-    local function fmtNum(n)
-        local str = tostring(math.floor(n))
-        local out = str:reverse():gsub("(%d%d%d)", "%1."):reverse()
-        return (out:gsub("^%.", ""))
-    end
-
-    local function blockName(id)
-        local it = ItemDB[id]
-        local nm = itemName(id)
-        if it and it.kind == "seed" then nm = nm .. " (pohon)" end
-        return nm
-    end
-
-    -- Ubah hitungan {id = jumlah} jadi teks, urut dari terbanyak
-    local function listText(counts, nameFn)
-        local list = {}
-        for id, n in pairs(counts) do list[#list + 1] = { id = id, n = n } end
-        table.sort(list, function(a, b)
-            if a.n ~= b.n then return a.n > b.n end
-            return a.id < b.id
-        end)
-        local filter = string.lower(Scan.Filter or "")
-        local lines, total = {}, 0
-        for _, e in ipairs(list) do
-            local name = nameFn(e.id)
-            if filter == "" or string.find(string.lower(name), filter, 1, true) then
-                total += 1
-                if total <= Scan.Limit then
-                    lines[#lines + 1] = name .. "  x" .. fmtNum(e.n)
-                end
-            end
-        end
-        if total > Scan.Limit then lines[#lines + 1] = ("... +%d item lain (pakai Cari item)"):format(total - Scan.Limit) end
-        if #lines == 0 then lines[1] = (filter ~= "") and "Tidak ada yang cocok" or "Kosong" end
-        return table.concat(lines, "\n"), total
-    end
-
-    local function scanFloating()
-        local counts, total, piles = {}, 0, 0
-        local list = Drops.list
-        if type(list) ~= "table" then return nil end
-        for _, d in pairs(list) do
-            if type(d) == "table" and type(d.id) == "number" then
-                local n = tonumber(d.n) or 1
-                if n > 0 then
-                    counts[d.id] = (counts[d.id] or 0) + n
-                    total += n
-                    piles += 1
-                end
-            end
-        end
-        return counts, total, piles
-    end
-
-    local function scanBlocks()
-        local w = Refs.World
-        if not w or type(w.fg) ~= "table" or type(w.w) ~= "number" then return nil end
-        local fgC, bgC, nf, nb = {}, {}, 0, 0
-        local trees = {} -- [seed] = { r = siap, g = tumbuh, nxt = detik ke panen berikutnya }
-        local st = workspace:GetServerTimeNow()
-        local readyAt = Auto.treeReadyAt
-        for y = 0, w.h - 1 do
-            local rf = w.fg[y]
-            local rb = w.bg and w.bg[y]
-            for x = 0, w.w - 1 do
-                local a = rf and rf[x] or 0
-                if a ~= 0 then
-                    fgC[a] = (fgC[a] or 0) + 1
-                    nf += 1
-                    local it = ItemDB[a]
-                    if readyAt and it and it.kind == "seed" then
-                        local ra = readyAt(x, y, a)
-                        if ra then
-                            local e = trees[a]
-                            if not e then
-                                e = { r = 0, g = 0 }
-                                trees[a] = e
-                            end
-                            if st >= ra then
-                                e.r += 1
-                            else
-                                e.g += 1
-                                if not e.nxt or ra - st < e.nxt then e.nxt = ra - st end
-                            end
-                        end
-                    end
-                end
-                local b = rb and rb[x] or 0
-                if b ~= 0 then
-                    bgC[b] = (bgC[b] or 0) + 1
-                    nb += 1
-                end
-            end
-            if y % 64 == 63 then task.wait() end -- world besar: jangan bikin lag
-        end
-        return fgC, bgC, nf, nb, trees
-    end
-
-    local function waitText(sec)
-        sec = math.max(0, math.floor(sec or 0))
-        if sec >= 3600 then return ("%dj %dm"):format(sec // 3600, sec % 3600 // 60) end
-        return ("%dm %dd"):format(sec // 60, sec % 60)
-    end
-
-    -- Daftar pohon: siap panen dulu, lalu yang paling cepat siap
-    local function treeText(trees)
-        local list, totalR, totalG = {}, 0, 0
-        local filter = string.lower(Scan.Filter or "")
-        for id, e in pairs(trees) do
-            totalR += e.r
-            totalG += e.g
-            local name = itemName(id)
-            if filter == "" or string.find(string.lower(name), filter, 1, true) then
-                list[#list + 1] = { name = name, e = e }
-            end
-        end
-        table.sort(list, function(a, b)
-            if a.e.r ~= b.e.r then return a.e.r > b.e.r end
-            return (a.e.nxt or math.huge) < (b.e.nxt or math.huge)
-        end)
-        local lines = {}
-        for i, v in ipairs(list) do
-            if i > Scan.Limit then
-                lines[#lines + 1] = ("... +%d jenis lain"):format(#list - Scan.Limit)
-                break
-            end
-            local line = ("%s: %d siap | %d tumbuh"):format(v.name, v.e.r, v.e.g)
-            if v.e.nxt then line = line .. " (berikut " .. waitText(v.e.nxt) .. ")" end
-            lines[#lines + 1] = line
-        end
-        if #lines == 0 then lines[1] = (filter ~= "") and "Tidak ada yang cocok" or "Tidak ada pohon" end
-        return table.concat(lines, "\n"), totalR, totalG
-    end
-
-    local function setDesc(el, txt, key)
-        if Scan[key] == txt then return end
-        Scan[key] = txt
-        if el then pcall(function() el:SetDesc(txt) end) end
-    end
-
-    function Scan.run()
-        if Scan.Busy then return end
-        Scan.Busy = true
-        local w = Refs.World
-        local fl, flTotal, piles = scanFloating()
-        local fgC, bgC, nf, nb, trees = scanBlocks()
-        local treeTxt, treeR, treeG = "Data pohon belum ketemu", nil, nil
-        if trees then treeTxt, treeR, treeG = treeText(trees) end
-
-        local floatText = fl and select(1, listText(fl, itemName)) or "Data drop belum ketemu. Tekan 'Hubungkan ke game'"
-        local blockText = "Data world belum ketemu. Tekan 'Hubungkan ke game'"
-        if fgC then
-            local pick
-            if Scan.Layer == "Depan" then
-                pick = fgC
-            elseif Scan.Layer == "Background" then
-                pick = bgC
-            else
-                pick = {}
-                for id, n in pairs(fgC) do pick[id] = (pick[id] or 0) + n end
-                for id, n in pairs(bgC) do pick[id] = (pick[id] or 0) + n end
-            end
-            blockText = select(1, listText(pick, blockName))
-        end
-
-        local name = w and rawget(w, "name")
-        local info = table.concat({
-            "World: " .. ((type(name) == "string" and name ~= "") and name or "-")
-                .. (w and type(w.w) == "number" and (" (" .. w.w .. "x" .. w.h .. ")") or ""),
-            "Block depan: " .. (nf and fmtNum(nf) or "-") .. " | Background: " .. (nb and fmtNum(nb) or "-"),
-            "Floating: " .. (flTotal and (fmtNum(flTotal) .. " item (" .. piles .. " tumpukan)") or "-"),
-            "Pohon: " .. (treeR and (fmtNum(treeR) .. " siap panen | " .. fmtNum(treeG) .. " tumbuh") or "-"),
-            "Scan terakhir: " .. os.date("%H:%M:%S"),
-        }, "\n")
-
-        setDesc(UI.ScanInfo, info, "_info")
-        setDesc(UI.ScanFloat, floatText, "_float")
-        setDesc(UI.ScanBlocks, blockText, "_blocks")
-        setDesc(UI.ScanTrees, treeTxt, "_trees")
-        Scan.Busy = false
-    end
-
-    task.spawn(function()
-        local last = 0
-        while alive() do
-            if Scan.Auto and os.clock() - last >= Scan.Every then
-                last = os.clock()
-                pcall(Scan.run)
-            end
-            task.wait(0.5)
-        end
-    end)
-end)() end
-
-Config.add("Growscan", Scan, { "Auto", "Layer" })
-
--- ===== TAB: GROWSCAN =====
-do (function() -- fungsi sendiri: variabel di dalam tidak ikut batas 200 local
-    local ScanTab = makeTab("Growscan", "scan-search", "fitur")
-
-    safe(function()
-        UI.ScanInfo = ScanTab:Paragraph({ Title = "Info World", Desc = "Tekan Scan sekarang" })
-    end)
-
-    local sCtl = box(ScanTab, "Kontrol", true)
-    local sFloat = box(ScanTab, "Floating Items", true)
-    local sBlock = box(ScanTab, "World Blocks", false)
-    local sTree = box(ScanTab, "Pohon (siap panen)", true)
-
-    safe(function()
-        sCtl:Toggle({
-            Title = "Auto Scan",
-            Desc = "Update otomatis tiap 2 detik",
-            Value = Scan.Auto,
-            Callback = function(on)
-                Scan.Auto = on
-                if on then task.spawn(Scan.run) end
-            end,
-        })
-    end)
-
-    safe(function()
-        sCtl:Button({
-            Title = "Scan sekarang",
-            Callback = function() task.spawn(Scan.run) end,
-        })
-    end)
-
-    safe(function()
-        sCtl:Input({
-            Title = "Cari item",
-            Desc = "Saring nama item (kosongkan = semua)",
-            Value = "",
-            Placeholder = "contoh: seed",
-            Callback = function(text)
-                Scan.Filter = tostring(text or ""):gsub("^%s+", ""):gsub("%s+$", "")
-                task.spawn(Scan.run)
-            end,
-        })
-    end)
-
-    safe(function()
-        UI.ScanFloat = sFloat:Paragraph({ Title = "Daftar", Desc = "-" })
-    end)
-
-    safe(function()
-        sBlock:Dropdown({
-            Title = "Layer",
-            Values = { "Semua", "Depan", "Background" },
-            Value = Scan.Layer,
-            Callback = function(opt)
-                Scan.Layer = opt
-                task.spawn(Scan.run)
-            end,
-        })
-    end)
-
-    safe(function()
-        UI.ScanBlocks = sBlock:Paragraph({ Title = "Daftar", Desc = "-" })
-    end)
-
-    safe(function()
-        UI.ScanTrees = sTree:Paragraph({ Title = "Daftar", Desc = "-" })
-    end)
-end)() end
-
----------------------------------------------------------------------
--- STATISTIK SESI
----------------------------------------------------------------------
--- Cara kerja:
---   - Saat execute (atau tombol Reset), angka awal dicatat.
---   - Tiap detik: angka sekarang - angka awal = hasil sesi. Dibagi lama sesi = per jam.
---   - Gems dibaca dari angka gems di HUD game (nilai di dalam fungsi addGems).
-do (function()
-    local function gemsNow()
-        local g = Refs.Gems
-        local f = g and rawget(g, "addGems")
-        if type(f) ~= "function" then return nil end
-        for _, v in pairs(getUpvalues(f)) do
-            if type(v) == "number" then return v end
-        end
-        return nil
-    end
-    Stats.gemsNow = gemsNow
-
-    local function fmt(n)
-        local str = tostring(math.floor(n or 0))
-        local neg = string.sub(str, 1, 1) == "-"
-        if neg then str = string.sub(str, 2) end
-        local out = str:reverse():gsub("(%d%d%d)", "%1."):reverse()
-        out = out:gsub("^%.", "")
-        return (neg and "-" or "") .. out
-    end
-
-    local function dur(sec)
-        sec = math.max(0, math.floor(sec))
-        return ("%dj %dm %dd"):format(sec // 3600, sec % 3600 // 60, sec % 60)
-    end
-
-    -- angka yang dihitung (semuanya naik terus selama script jalan)
-    local function counters()
-        return {
-            broken = State.Broken, placed = State.Placed, collected = State.Collected,
-            harvested = Farmer.Harvested, planted = Farmer.Planted,
-        }
-    end
-
-    function Stats.reset()
-        Stats.T0 = os.clock()
-        Stats.Gems0 = gemsNow()
-        Stats.Items = {}
-        Stats.Base = counters()
-    end
-    Stats.Base = counters()
-
-    function Stats.text()
-        local hours = math.max((os.clock() - Stats.T0) / 3600, 1 / 3600)
-        local now, base = counters(), Stats.Base
-        local function line(label, key)
-            local v = now[key] - (base[key] or 0)
-            return ("%s: %s  (%s/jam)"):format(label, fmt(v), fmt(v / hours))
-        end
-        local g = gemsNow()
-        if g and not Stats.Gems0 then Stats.Gems0 = g end
-        local gemLine = "Gems: -"
-        if g and Stats.Gems0 then
-            local d = g - Stats.Gems0
-            gemLine = ("Gems: %s  (%s%s, %s/jam)"):format(fmt(g), d >= 0 and "+" or "", fmt(d), fmt(d / hours))
-        end
-        -- 5 item terbanyak yang terkumpul
-        local top = {}
-        for id, n in pairs(Stats.Items) do top[#top + 1] = { id = id, n = n } end
-        table.sort(top, function(a, b) return a.n > b.n end)
-        local tops = {}
-        for i = 1, math.min(5, #top) do tops[i] = itemName(top[i].id) .. " x" .. fmt(top[i].n) end
-        return table.concat({
-            "Lama sesi: " .. dur(os.clock() - Stats.T0),
-            gemLine,
-            line("Block pecah", "broken"),
-            line("Block di-place", "placed"),
-            line("Drop diambil", "collected"),
-            line("Panen", "harvested"),
-            line("Tanam", "planted"),
-            "Item terbanyak: " .. ((#tops > 0) and table.concat(tops, ", ") or "-"),
-        }, "\n")
-    end
-
-    task.spawn(function()
-        local lastReport = os.clock()
-        while alive() do
-            local ok, txt = pcall(Stats.text)
-            if ok and UI.StatsText and txt ~= Stats.Shown then
-                Stats.Shown = txt
-                pcall(function() UI.StatsText:SetDesc(txt) end)
-            end
-            -- laporan berkala ke Discord
-            if Hook.ReportMin > 0 and os.clock() - lastReport >= Hook.ReportMin * 60 then
-                lastReport = os.clock()
-                if ok then Hook.send("report", "Laporan statistik\n```\n" .. txt .. "\n```") end
-            elseif Hook.ReportMin <= 0 then
-                lastReport = os.clock()
-            end
-            task.wait(1)
-        end
-    end)
-end)() end
-
--- ===== TAB: STATISTIK =====
-do (function()
-    local StatTab = makeTab("Statistik", "bar-chart-3", "fitur")
-
-    safe(function()
-        UI.StatsText = StatTab:Paragraph({ Title = "Sesi ini", Desc = "-" })
-    end)
-
-    safe(function()
-        StatTab:Button({
-            Title = "Reset statistik",
-            Desc = "Mulai hitung dari nol",
-            Callback = function()
-                Stats.reset()
-                notify("Statistik", "Direset", 2)
-            end,
-        })
-    end)
-
-    safe(function()
-        StatTab:Button({
-            Title = "Kirim ke Discord sekarang",
-            Desc = "Perlu webhook di tab Discord",
-            Callback = function()
-                local ok, txt = pcall(Stats.text)
-                if not (Hook.On and Hook.valid(Hook.Url)) then
-                    notify("Statistik", "Aktifkan webhook Discord dulu", 3)
-                elseif ok then
-                    Hook.send("report", "Laporan statistik\n```\n" .. txt .. "\n```")
-                    notify("Statistik", "Masuk antrian kirim", 2)
-                end
-            end,
-        })
-    end)
-end)() end
-
----------------------------------------------------------------------
--- TAS: auto recycle item sampah & auto convert lock
----------------------------------------------------------------------
--- Cara kerja (sama seperti tombol di inventori game):
---   Recycle : hapus dari inventori lalu World.call("Recycle", id, jumlah)
---   Convert : 100 World Lock -> 1 Diamond Lock, 100 Diamond Lock -> 1 Blue Gem Lock
---             lewat World.call("ConvertLock", dari, ke)
--- Tool & lock tidak bisa dipilih untuk recycle (supaya tidak terbuang tidak sengaja).
-local Bag = {
-    TrashOn = false,
-    TrashList = {},    -- daftar id item yang di-recycle
-    TrashAt = 150,     -- recycle kalau jumlahnya sudah segini
-    Keep = 0,          -- sisakan sebanyak ini
-    LockOn = false,
-    Recycled = 0,
-    Converted = 0,
-    Status = "-",
-}
-
-do (function()
-    local LOCK_IDS = { [242] = true, [1796] = true, [7188] = true }
-    local LOCK_STEPS = {
-        { from = 242, to = 1796, name = "Diamond Lock" },
-        { from = 1796, to = 7188, name = "Blue Gem Lock" },
-    }
-
-    local function worldCall(...)
-        local w = Refs.World
-        local f = w and rawget(w, "call")
-        if type(f) ~= "function" then return false end
-        return pcall(f, ...)
-    end
-
-    local function trashable(id)
-        local it = ItemDB[id]
-        return it ~= nil and it.kind ~= "tool" and not LOCK_IDS[id]
-    end
-
-    function Bag.recycle(id, n)
-        if not Refs.Inv or n <= 0 or not trashable(id) then return false end
-        n = math.min(n, invCount(id))
-        if n <= 0 then return false end
-        pcall(function() Refs.Inv:remove(id, n) end)
-        local ok = worldCall("Recycle", id, n)
-        if ok then
-            Bag.Recycled += n
-            Bag.Status = ("Recycle %s x%d"):format(itemName(id), n)
-        end
-        return ok
-    end
-
-    -- sama seperti cek tombol convert di game (muat atau tidak)
-    local function convertLock(step)
-        local inv = Refs.Inv
-        if not inv or invCount(step.from) < 100 then return false end
-        local okU, used = pcall(function() return inv:used() end)
-        local okC, cap = pcall(function() return inv.capacity end)
-        if invCount(step.to) + 1 > 200 then return false end
-        if invCount(step.to) == 0 and invCount(step.from) ~= 100 and okU and okC
-            and type(used) == "number" and type(cap) == "number" and used >= cap then
-            return false
-        end
-        pcall(function()
-            inv:remove(step.from, 100)
-            inv:add(step.to, 1)
-        end)
-        local ok = worldCall("ConvertLock", step.from, step.to)
-        if ok then
-            Bag.Converted += 1
-            Bag.Status = "Convert ke " .. step.name
-        end
-        return ok
-    end
-
-    function Bag.tick()
-        if Bag.TrashOn then
-            for _, id in ipairs(Bag.TrashList) do
-                local n = invCount(id)
-                if n >= Bag.TrashAt and n > Bag.Keep then
-                    Bag.recycle(id, n - Bag.Keep)
-                    task.wait(0.5)
-                end
-            end
-        end
-        if Bag.LockOn then
-            for _, step in ipairs(LOCK_STEPS) do
-                if convertLock(step) then task.wait(0.5) end
-            end
-        end
-    end
-
-    -- label dropdown: item di inventori yang boleh di-recycle
-    function Bag.labels()
-        local out, seen = {}, {}
-        for _, slot in ipairs(Refs.inventoryEntries()) do
-            local id = slot.id
-            if not seen[id] and trashable(id) then
-                seen[id] = true
-                out[#out + 1] = { id = id, label = ("%s [%d]"):format(itemName(id), id) }
-            end
-        end
-        -- item yang sudah dipilih tetap tampil walau sedang habis
-        for _, id in ipairs(Bag.TrashList) do
-            if not seen[id] then
-                seen[id] = true
-                out[#out + 1] = { id = id, label = ("%s [%d]"):format(itemName(id), id) }
-            end
-        end
-        table.sort(out, function(a, b) return a.id < b.id end)
-        local labels, picked = {}, {}
-        for _, e in ipairs(out) do
-            labels[#labels + 1] = e.label
-            if table.find(Bag.TrashList, e.id) then picked[#picked + 1] = e.label end
-        end
-        return labels, picked
-    end
-
-    task.spawn(function()
-        while alive() do
-            pcall(Bag.tick)
-            if UI.BagStatus then
-                local txt = ("Status: %s\nDi-recycle: %d item | Convert lock: %d kali\nItem dipilih: %d"):format(
-                    Bag.Status, Bag.Recycled, Bag.Converted, #Bag.TrashList)
-                if txt ~= Bag.Shown then
-                    Bag.Shown = txt
-                    pcall(function() UI.BagStatus:SetDesc(txt) end)
-                end
-            end
-            task.wait(3)
-        end
-    end)
-end)() end
-
-Config.add("Tas", Bag, { "TrashOn", "TrashList", "TrashAt", "Keep", "LockOn" })
-
--- ===== TAB: TAS =====
-do (function()
-    local BagTab = makeTab("Tas", "backpack", "fitur")
-
-    safe(function()
-        UI.BagStatus = BagTab:Paragraph({ Title = "Status", Desc = "-" })
-    end)
-
-    local bTrash = box(BagTab, "Auto Recycle (buang item)", true)
-    local bLock = box(BagTab, "Auto Convert Lock", false)
-
-    safe(function()
-        bTrash:Toggle({
-            Title = "Auto Recycle",
-            Desc = "Item yang dipilih di-recycle otomatis",
-            Value = Bag.TrashOn,
-            Callback = function(on) Bag.TrashOn = on end,
-        })
-    end)
-
-    safe(function()
-        local labels, picked = Bag.labels()
-        UI.TrashDropdown = bTrash:Dropdown({
-            Title = "Item yang di-recycle",
-            Desc = "Bisa pilih banyak. Tool & lock tidak ditampilkan",
-            Values = (#labels > 0) and labels or { "(inventori belum terbaca)" },
-            Value = picked,
-            Multi = true,
-            AllowNone = true,
-            Callback = function(opts)
-                local list = {}
-                for _, label in ipairs(type(opts) == "table" and opts or { opts }) do
-                    local id = tonumber(string.match(tostring(label), "%[(%d+)%]$"))
-                    if id then list[#list + 1] = id end
-                end
-                Bag.TrashList = list
-            end,
-        })
-    end)
-
-    -- dipanggil saat inventori berubah
-    local lastSig = nil
-    UI.TrashRefresh = function(force)
-        local labels, picked = Bag.labels()
-        local sig = table.concat(labels, "|")
-        if not force and sig == lastSig then return end
-        if not UI.TrashDropdown then return end
-        local ok = UI.ddRefresh(UI.TrashDropdown, (#labels > 0) and labels or { "(inventori kosong)" })
-        if ok and #picked > 0 then
-            local err
-            ok, err = UI.exec(function() UI.TrashDropdown:Select(picked) end)
-            if not ok then UI.DropErr = "Tas: " .. tostring(err) end
-        end
-        lastSig = ok and sig or nil
-    end
-
-    addNumber(bTrash, {
-        Title = "Recycle kalau jumlah >=",
-        Desc = "200 = hanya saat penuh 1 slot",
-        Min = 1, Max = 200, Step = 1, Default = Bag.TrashAt,
-        Callback = function(v) Bag.TrashAt = math.floor(v) end,
-    })
-
-    addNumber(bTrash, {
-        Title = "Sisakan",
-        Desc = "Jumlah yang tidak ikut di-recycle",
-        Min = 0, Max = 199, Step = 1, Default = Bag.Keep,
-        Callback = function(v) Bag.Keep = math.floor(v) end,
-    })
-
-    safe(function()
-        bTrash:Button({
-            Title = "Refresh daftar item",
-            Callback = function() UI.later("trash", function() UI.TrashRefresh(true) end) end,
-        })
-    end)
-
-    safe(function()
-        bLock:Toggle({
-            Title = "Auto Convert Lock",
-            Desc = "100 WL -> 1 DL, 100 DL -> 1 BGL (sama seperti game)",
-            Value = Bag.LockOn,
-            Callback = function(on) Bag.LockOn = on end,
-        })
-    end)
-end)() end
-
----------------------------------------------------------------------
--- AUTO SPLICE
----------------------------------------------------------------------
--- Cara kerja (sama seperti splice manual di game):
---   1. Tanam Seed A di tile Grid yang kosong (di bawahnya harus ada block).
---   2. Taruh Seed B di atas pohon A -> World.spliceSeed(x, y, B).
---   3. Server membalas id pohon hasil splice, tile langsung diganti di layar.
---   Hasil splice diperkirakan dulu pakai modul Splice game; kalau tidak bisa, tidak dijalankan.
-do (function()
-    local okMod, SpliceMod = pcall(require, Shared:FindFirstChild("Splice"))
-
-    function Splice.result(a, b)
-        if not (okMod and type(SpliceMod) == "table" and type(SpliceMod.result) == "function") then return nil end
-        if not (a and b) then return nil end
-        local ok, r = pcall(SpliceMod.result, a, b)
-        return ok and r or nil
-    end
-
-    local function setVisual()
-        if UI.SpliceToggle then pcall(function() UI.SpliceToggle:Set(Splice.Running) end) end
-    end
-
-    function Splice.stop(reason)
-        Splice.Running = false
-        if Splice.Roaming then Auto.stopSpliceRoam() end
-        Splice.Status = reason or "Dihentikan"
-        setVisual()
-        if reason then notify("Auto Splice", reason, 4) end
-    end
-
-    local function treeSpliced(x, y)
-        local t = Auto.treeEntry(x, y)
-        return type(t) == "table" and t.s == true
-    end
-
-    local function spliceAt(x, y)
-        local w = Refs.World
-        local f = w and rawget(w, "spliceSeed")
-        if type(f) ~= "function" then return false, "fungsi splice game tidak ketemu" end
-        local ok, made = pcall(f, x, y, Splice.B)
-        if ok and made and ItemDB[made] then
-            pcall(function() Refs.Inv:remove(Splice.B, 1) end)
-            if Refs.SetTile then pcall(Refs.SetTile, "fg", x, y, made, true) end -- ganti di layar saja
-            Splice.Made += 1
-            Splice.Status = ("Splice jadi %s (%d,%d)"):format(itemName(made), x, y)
-            return true
-        end
-        return false, "ditolak server"
-    end
-
-    local function loop(runId)
-        while Splice.Running and alive() and Splice.RunId == runId do
-            local px, py = getPlayerTile()
-            if not px then
-                Splice.stop("Karakter tidak ditemukan (keluar world?)")
-                return
-            end
-            local A, B = Splice.A, Splice.B
-            local acted = false
-            local now = os.clock()
-            for _, o in ipairs(sortedOffsets()) do
-                if not Splice.Running then break end
-                local x, y = px + o.dx, py + o.dy
-                local key = x .. "," .. y
-                if not (Splice.Fail[key] and Splice.Fail[key] > now) then
-                    local fg = tileAt("fg", x, y)
-                    -- 1) tanam Seed A
-                    if fg == 0 and invCount(A) > 0 and invCount(B) > 0 and Auto.plantSpotOk(x, y, A) then
-                        sendSetTile("fg", x, y, A)
-                        pcall(function() Refs.Inv:remove(A, 1) end)
-                        Splice.Planted += 1
-                        Splice.Status = ("Tanam %s (%d,%d)"):format(itemName(A), x, y)
-                        acted = true
-                        task.wait(Splice.Ms / 1000)
-                        fg = tileAt("fg", x, y)
-                    end
-                    -- 2) splice Seed B ke pohon A
-                    if fg == A and invCount(B) > 0 and not treeSpliced(x, y) then
-                        local ok, why = spliceAt(x, y)
-                        if not ok then
-                            Splice.Fail[key] = os.clock() + 30
-                            Splice.Status = ("Gagal splice (%d,%d): %s"):format(x, y, why)
-                        end
-                        acted = true
-                        task.wait(Splice.Ms / 1000)
-                    end
-                end
-            end
-            if not acted then
-                if invCount(A) <= 0 or invCount(B) <= 0 then
-                    Splice.stop("Seed habis")
-                    return
-                end
-                Splice.Status = "Menunggu tile Grid kosong (panen dulu pohonnya)"
-                task.wait(1)
-            end
-        end
-    end
-
-    function Splice.start()
-        if Splice.Running then return end
-        local err
-        if not Refs.World then
-            err = "Data world belum ketemu. Tekan 'Hubungkan ke game'"
-        elseif not (Splice.A and Splice.B) then
-            err = "Pilih Seed A dan Seed B dulu"
-        elseif Splice.A == Splice.B then
-            err = "Seed A dan Seed B harus beda"
-        elseif not Splice.result(Splice.A, Splice.B) then
-            err = "Kombinasi ini tidak bisa di-splice"
-        elseif not Splice.Roam and next(State.Offsets) == nil then
-            err = "Pilih tile dulu di Grid Tile (tab Farm), atau nyalakan Keliling world"
-        elseif State.Running or Clear.Running or Farmer.Running then
-            err = "Hentikan Auto Farm / Clear / Farmer dulu"
-        end
-        if err then
-            notify("Auto Splice", err, 4)
-            setVisual()
-            return
-        end
-        table.clear(Splice.Fail)
-        Splice.Running = true
-        Splice.RunId = (Splice.RunId or 0) + 1
-        setVisual()
-        if Splice.Roam then
-            local e = Auto.startSpliceRoam()
-            if e then Splice.stop(e) end
-        else
-            task.spawn(loop, Splice.RunId)
-        end
-    end
-
-    function Splice.resultText()
-        if not (Splice.A and Splice.B) then return "Pilih Seed A dan Seed B" end
-        local r = Splice.result(Splice.A, Splice.B)
-        if not r then return "Hasil: tidak bisa di-splice" end
-        return "Hasil: " .. itemName(r)
-    end
-
-    task.spawn(function()
-        while alive() do
-            if UI.SpliceStatus then
-                local txt = ("Status: %s\n%s\nSeed A: %s (x%d) | Seed B: %s (x%d)\nDitanam: %d | Splice jadi: %d"):format(
-                    Splice.Running and Splice.Status or ("BERHENTI - " .. Splice.Status), Splice.resultText(),
-                    Splice.A and itemName(Splice.A) or "-", Splice.A and invCount(Splice.A) or 0,
-                    Splice.B and itemName(Splice.B) or "-", Splice.B and invCount(Splice.B) or 0,
-                    Splice.Planted, Splice.Made)
-                if txt ~= Splice.Shown then
-                    Splice.Shown = txt
-                    pcall(function() UI.SpliceStatus:SetDesc(txt) end)
-                end
-            end
-            task.wait(1)
-        end
-    end)
-end)() end
-
-Config.add("Splice", Splice, { "A", "B", "Ms", "Roam" })
-Splice.Ms = math.max(Splice.Ms, 140)
-
--- ===== TAB: SPLICE =====
-do (function()
-    local SpTab = makeTab("Splice", "git-merge", "farm")
-
-    safe(function()
-        UI.SpliceStatus = SpTab:Paragraph({ Title = "Status Splice", Desc = "-" })
-    end)
-
-    local sCtl = box(SpTab, "Kontrol", true)
-    local sSeed = box(SpTab, "Seed", true)
-    local sSpeed = box(SpTab, "Kecepatan", false)
-
-    safe(function()
-        UI.SpliceToggle = sCtl:Toggle({
-            Title = "Auto Splice",
-            Desc = "Tanam Seed A lalu splice Seed B",
-            Value = false,
-            Callback = function(on)
-                if on then Splice.start() elseif Splice.Running then Splice.stop() end
-            end,
-        })
-    end)
-
-    local function seedLabels()
-        local labels = {}
-        for _, id in ipairs(seedIds()) do labels[#labels + 1] = ("%s [%d]"):format(itemName(id), id) end
-        if #labels == 0 then labels = { "(tidak ada seed di inventori)" } end
-        return labels
-    end
-    local function idOf(opt) return tonumber(string.match(tostring(opt or ""), "%[(%d+)%]$")) end
-
-    safe(function()
-        UI.SpliceA = sSeed:Dropdown({
-            Title = "Seed A (ditanam)",
-            Values = { "(memuat...)" },
-            Callback = function(opt)
-                local id = idOf(opt)
-                if id then Splice.A = id end
-            end,
-        })
-    end)
-
-    safe(function()
-        UI.SpliceB = sSeed:Dropdown({
-            Title = "Seed B (di-splice)",
-            Values = { "(memuat...)" },
-            Callback = function(opt)
-                local id = idOf(opt)
-                if id then Splice.B = id end
-            end,
-        })
-    end)
-
-    -- dipanggil saat inventori berubah
-    local lastSig = nil
-    UI.SpliceRefresh = function(force)
-        local labels = seedLabels()
-        local sig = table.concat(labels, "|")
-        if not force and sig == lastSig then return end
-        local ok = true
-        for _, pair in ipairs({ { UI.SpliceA, Splice.A }, { UI.SpliceB, Splice.B } }) do
-            local dd, id = pair[1], pair[2]
-            if dd then
-                local refreshed = UI.ddRefresh(dd, labels)
-                if refreshed then refreshed = selectSaved(dd, labels, id) end
-                ok = ok and refreshed
-            end
-        end
-        lastSig = ok and sig or nil
-    end
-
-    safe(function()
-        sSeed:Button({
-            Title = "Refresh daftar seed",
-            Callback = function() UI.later("splice", function() UI.SpliceRefresh(true) end) end,
-        })
-    end)
-
-    safe(function()
-        sCtl:Toggle({
-            Title = "Keliling world (A*)",
-            Desc = "Nyala: jalan ke seluruh world. Mati: hanya tile Grid 5x5",
-            Value = Splice.Roam,
-            Callback = function(on)
-                if Splice.Running then Splice.stop("Mode diganti, nyalakan lagi") end
-                Splice.Roam = on
-            end,
-        })
-    end)
-
-    addNumber(sSpeed, {
-        Title = "Jeda tanam / splice (ms)",
-        Min = 140, Max = 2000, Step = 10, Default = Splice.Ms,
-        Callback = function(v) Splice.Ms = math.floor(v) end,
-    })
-end)() end
-
--- ===== TAB: LAHAN (bangun farm world) =====
-do (function()
-    local LTab = makeTab("Lahan", "layout-grid", "farm")
-
-    safe(function()
-        UI.LahanStatus = LTab:Paragraph({ Title = "Status Lahan", Desc = "-" })
-    end)
-
-    local lCtl = box(LTab, "Bangun Lahan", true)
-    local lShape = box(LTab, "Bentuk lahan", true)
-
-    safe(function()
-        UI.BuildToggle = lCtl:Toggle({
-            Title = "Bangun Lahan",
-            Desc = "Gali dulu dari permukaan sampai bawah, lalu pasang baris naik sampai atas (baris jadi jembatan). Block habis: produksi 1 baris",
-            Value = false,
-            Callback = function(on)
-                if on then Build.start() elseif Build.Running then Build.stop() end
-            end,
-        })
-    end)
-
-    safe(function()
-        UI.BuildBlockDropdown = lCtl:Dropdown({
-            Title = "Block lahan",
-            Desc = "Block padat dari inventori",
-            Values = { "(memuat...)" },
-            Callback = function(opt)
-                local id = tonumber(string.match(opt or "", "%[(%d+)%]$"))
-                if id then Build.BlockId = id end
-            end,
-        })
-    end)
-
-    local function num(text, def)
-        local v = tonumber(tostring(text or ""):match("%-?%d+"))
-        return v or def
-    end
-
-    safe(function()
-        lShape:Input({
-            Title = "X awal",
-            Desc = "Kolom paling kiri",
-            Value = tostring(Land.X0),
-            Placeholder = "0",
-            Callback = function(t) Land.X0 = math.max(0, num(t, Land.X0)) end,
-        })
-    end)
-
-    safe(function()
-        lShape:Input({
-            Title = "X akhir",
-            Desc = "Kolom paling kanan (lebih dari lebar world = sampai ujung)",
-            Value = tostring(Land.X1),
-            Placeholder = "99",
-            Callback = function(t) Land.X1 = math.max(0, num(t, Land.X1)) end,
-        })
-    end)
-
-    safe(function()
-        lShape:Input({
-            Title = "Y baris atas",
-            Desc = "Baris block paling atas. Baris di bawahnya otomatis sampai di atas bedrock (tanah digali)",
-            Value = tostring(Land.Y0),
-            Placeholder = "2",
-            Callback = function(t) Land.Y0 = math.max(1, num(t, Land.Y0)) end,
-        })
-    end)
-
-    safe(function()
-        lShape:Button({
-            Title = "Pakai posisi karakter sebagai pojok kiri-atas",
-            Desc = "Berdiri di atas block pertama baris paling atas, lalu tekan (tangga kiri di sebelah kirinya)",
-            Callback = function()
-                local x, y = Auto.here()
-                if not x then
-                    notify("Lahan", "Kamu belum masuk world", 3)
-                    return
-                end
-                -- block yang dipijak = block pertama baris atas, kolom tangga kiri di sebelah kirinya
-                Land.X0, Land.Y0 = math.max(0, x - 1), y + 1
-                notify("Lahan", ("X awal %d, Y baris atas %d"):format(Land.X0, Land.Y0), 4)
-            end,
-        })
-    end)
-
-    safe(function()
-        lCtl:Toggle({
-            Title = "Lanjut Pabrik setelah selesai",
-            Value = Build.ThenPabrik,
-            Callback = function(on) Build.ThenPabrik = on end,
-        })
-    end)
-
-    safe(function()
-        lCtl:Button({
-            Title = "Posisi break produksi = posisi karakter",
-            Desc = "Berdiri di tempat break lalu tekan. Tekan lagi di tempat yang sama = kembali otomatis",
-            Callback = function()
-                local x, y = Auto.here()
-                if not x then
-                    notify("Lahan", "Kamu belum masuk world", 3)
-                    return
-                end
-                if Build.BreakX == x and Build.BreakY == y then
-                    Build.BreakX, Build.BreakY = -1, -1
-                    notify("Lahan", "Posisi break produksi: otomatis", 3)
-                else
-                    Build.BreakX, Build.BreakY = x, y
-                    if next(Build.Tiles) == nil then Build.Tiles["1,0"] = true end
-                    notify("Lahan", ("Posisi break produksi (%d,%d)"):format(x, y), 3)
-                end
-            end,
-        })
-    end)
-
-    safe(function()
-        lCtl:Button({
-            Title = "Pilih tile break produksi (Grid)",
-            Desc = "Grid terbuka dalam mode Lahan (terpisah dari Auto Farm & Pabrik)",
-            Callback = function()
-                if UI.setGridMode then UI.setGridMode("lahan") end
-                if UI.GridGui then UI.GridGui.Enabled = true end
-            end,
-        })
-    end)
-
-    task.spawn(function()
-        while alive() do
-            local txt
-            if Refs.World then
-                local info = Build.Info
-                if not (Build.Running and info) then
-                    local key = tostring(Build.BlockId) .. "|" .. Land.X0 .. "|" .. Land.X1 .. "|" .. Land.Y0
-                    if not info or not Build.InfoAt or os.clock() - Build.InfoAt > 5 or Build.InfoKey ~= key then
-                        info = Auto.landInfo(Build.BlockId)
-                        Build.Info, Build.InfoAt, Build.InfoKey = info, os.clock(), key
-                    end
-                end
-                local rows = Auto.landRows()
-                local have = Build.BlockId and invCount(Build.BlockId) or 0
-                local seed = Auto.seedOfBlock(Build.BlockId)
-                txt = table.concat({
-                    "Status   : " .. (Build.Running and "JALAN" or "BERHENTI") .. " - " .. Build.Phase,
-                    (#rows > 0) and ("Bentuk   : %d baris (y %d-%d), x %d-%d, 1 kosong per baris, tangga kiri & kanan"):format(
-                        #rows, rows[1], rows[#rows], math.min(Land.X0, Land.X1), math.max(Land.X0, Land.X1))
-                        or "Bentuk   : tidak ada baris yang muat (Y atas terlalu bawah)",
-                    ("Block    : %s | punya %d | butuh %d%s"):format(Build.BlockId and itemName(Build.BlockId) or "-",
-                        have, info.need, (info.need > have) and (" (kurang " .. (info.need - have) .. ")") or " (cukup)"),
-                    ("Terpasang: %d / %d%s"):format(info.done, info.total,
-                        info.blocked > 0 and (" | terhalang block lain: " .. info.blocked) or ""),
-                    (info.carve > 0) and ("Gali     : sisa " .. info.carve .. " tile (celah, tangga, background)")
-                        or "Gali     : selesai",
-                    "Seed block: " .. (seed and (itemName(seed) .. " x" .. invCount(seed)) or "-"),
-                    ("Produksi : panen %d | tanam %d"):format(Build.Harvested, Build.Planted),
-                    "Break    : " .. ((Build.BreakX >= 0 and next(Build.Tiles) ~= nil)
-                        and ("(" .. Build.BreakX .. "," .. Build.BreakY .. ") | grid lahan")
-                        or "otomatis (kanan karakter, dekat ujung baris)"),
-                    "Aksi     : " .. Build.Status,
-                }, "\n")
-            else
-                txt = "Data world belum ketemu"
-            end
-            if UI.LahanStatus and txt ~= Build.Shown then
-                Build.Shown = txt
-                pcall(function() UI.LahanStatus:SetDesc(txt) end)
-            end
-            -- tombol START di Grid (mode lahan)
-            if UI.GridMode == "lahan" and UI.GridStart then
-                UI.GridStart.Text = I18N.T(Build.Running and "STOP LAHAN" or "START LAHAN")
-                UI.GridStart.BackgroundColor3 = Build.Running and Color3.fromRGB(200, 60, 60) or Color3.fromRGB(46, 160, 90)
-            end
-            task.wait(1)
-        end
-    end)
-end)() end
-
--- ===== TAB: VENDING =====
-do (function()
-    local VTab = makeTab("Vending", "store", "farm")
-
-    safe(function()
-        UI.VendStatus = VTab:Paragraph({ Title = "Status Vending", Desc = "-" })
-    end)
-
-    local vCtl = box(VTab, "Kontrol", true)
-    local vItem = box(VTab, "Pilih item", true)
-    local vDrop = box(VTab, "Titik drop vending", true)
-
-    safe(function()
-        UI.VendToggle = vCtl:Toggle({
-            Title = "Jalankan Vending",
-            Desc = "Jalankan di world vending milikmu",
-            Value = false,
-            Callback = function(on)
-                if on then Vend.start() elseif Vend.Running then Vend.stop() end
-            end,
-        })
-    end)
-
-    safe(function()
-        vCtl:Dropdown({
-            Title = "Mode",
-            Values = Auto.VEND_MODES,
-            Value = Vend.Mode,
-            Callback = function(v)
-                if type(v) == "table" then v = v[1] end
-                if type(v) == "string" then Vend.Mode = v end
-            end,
-        })
-    end)
-
-    safe(function()
-        local labels, picked = Vend.labels(Refs.World and Vend.machines() or nil)
-        UI.VendItems = vItem:Dropdown({
-            Title = "Item yang diambil",
-            Desc = "Bisa pilih banyak. Kosong = semua item. Daftar: isi vending, tas & drop yang terlihat",
-            Values = (#labels > 0) and labels or { "(belum ada item)" },
-            Value = picked,
-            Multi = true,
-            AllowNone = true,
-            Callback = function(opts)
-                local list = {}
-                for _, label in ipairs(type(opts) == "table" and opts or { opts }) do
-                    local id = tonumber(string.match(tostring(label), "%[(%d+)%]$"))
-                    if id then list[#list + 1] = id end
-                end
-                Vend.Items = list
-            end,
-        })
-    end)
-
-    -- isi ulang daftar item kalau ada item baru (vending / tas / drop di world ini)
-    -- Hasil: jumlah item di daftar, teks rincian (tas / drop / vending) atau pesan error
-    function Vend.refreshItems(force, machines)
-        if not UI.VendItems then return 0, "dropdown belum dibuat" end
-        local ok, labels, picked, st = pcall(function()
-            local m = machines
-            if not m and Refs.World then
-                local okM, res = pcall(Vend.machines)
-                m = okM and res or nil
-            end
-            return Vend.labels(m)
-        end)
-        if not ok then
-            warn("[Zekio supreme] daftar item vending error: " .. tostring(labels))
-            return 0, "error: " .. tostring(labels)
-        end
-        local info = ("tas %d | drop %d | vending %d"):format(st.inv, st.drop, st.vend)
-        local sig = table.concat(labels, "|")
-        if not force and sig == Vend.ItemSig then return #labels, info end
-        Vend.ItemSig = sig
-        UI.later("vendItems", function()
-            local okR, errR = UI.exec(function()
-                UI.VendItems:Refresh((#labels > 0) and labels or { "(belum ada item)" })
-            end)
-            if not okR then
-                Vend.ItemSig = nil
-                warn("[Zekio supreme] refresh dropdown item vending gagal: " .. tostring(errR))
-                notify("Vending", "Daftar item gagal dimuat: " .. tostring(errR), 6)
-                return
-            end
-            if #picked > 0 then UI.exec(function() UI.VendItems:Select(picked) end) end
-        end)
-        return #labels, info
-    end
-
-    safe(function()
-        vItem:Button({
-            Title = "Muat ulang daftar item",
-            Desc = "Ambil item dari vending, tas & drop di world ini",
-            Callback = function()
-                local n, info = Vend.refreshItems(true)
-                notify("Vending", ("Daftar item: %d item (%s)"):format(n, tostring(info)), 5)
-            end,
-        })
-    end)
-
-    safe(function()
-        vItem:Button({
-            Title = "Tambah item yang dipegang",
-            Desc = "Pilih item di tas game (dipegang), lalu tekan. Masuk ke daftar item yang diambil",
-            Callback = function()
-                local id = nil
-                if Refs.Inv then pcall(function() id = tonumber(Refs.Inv.selected) end) end
-                local it = id and ItemDB[id]
-                if not it or it.kind == "tool" or it.lock then
-                    notify("Vending", "Pegang dulu block / seed di tas game (bukan tool)", 4)
-                    return
-                end
-                if not table.find(Vend.Items, id) then table.insert(Vend.Items, id) end
-                Vend.Seen[id] = true
-                Vend.refreshItems(true)
-                notify("Vending", "Item dipilih: " .. itemName(id), 3)
-            end,
-        })
-    end)
-
-    safe(function()
-        vItem:Button({
-            Title = "Hapus pilihan item",
-            Desc = "Kembali ke semua item",
-            Callback = function()
-                table.clear(Vend.Items)
-                Vend.ItemSig = nil
-                UI.later("vendClear", function() UI.exec(function() UI.VendItems:Select(nil) end) end)
-                Vend.refreshItems(true)
-                notify("Vending", "Pilihan item dihapus: semua item", 3)
-            end,
-        })
-    end)
-
-    safe(function()
-        UI.VendPointInput = vDrop:Input({
-            Title = "Titik drop vending",
-            Desc = "WORLD atau WORLD:ID (kosong = world ini). Isi stock: ambil drop di sini. Kosongkan: drop di sini",
-            Value = Vend.Point,
-            Placeholder = "STORAGE:ID",
-            Callback = function(t) Vend.Point = tostring(t or "") end,
-        })
-    end)
-
-    safe(function()
-        vDrop:Button({
-            Title = "Simpan posisi drop vending (posisi karakter)",
-            Desc = "Berdiri di tempat drop (boleh di world titik drop), lalu tekan. Dipakai mode isi stock & kosongkan",
-            Callback = function()
-                local x, y = Auto.here()
-                if not x then
-                    notify("Vending", "Kamu belum masuk world", 3)
-                    return
-                end
-                Vend.DropX, Vend.DropY = x, y
-                -- world titik drop ikut diisi, kecuali sudah pakai pintu (WORLD:ID / WORLD|ID)
-                local _, door = Vend.point()
-                if not door then
-                    Vend.Point = Guard.worldName()
-                    if UI.VendPointInput then pcall(function() UI.VendPointInput:Set(Vend.Point) end) end
-                end
-                notify("Vending", ("Posisi drop vending (%d,%d) di %s"):format(x, y, Vend.Point), 4)
-            end,
-        })
-    end)
-
-    safe(function()
-        vDrop:Button({
-            Title = "Hapus posisi drop vending",
-            Desc = "Drop / tunggu di titik kedatangan (pintu) saja",
-            Callback = function()
-                Vend.DropX, Vend.DropY = -1, -1
-                notify("Vending", "Posisi drop vending dihapus", 3)
-            end,
-        })
-    end)
-
-    task.spawn(function()
-        while alive() do
-            local txt
-            if Refs.World then
-                local list = Vend.machines()
-                local total, empty = 0, 0
-                for _, m in ipairs(list) do
-                    if m.id and m.stock > 0 then total += m.stock else empty += 1 end
-                end
-                local name, door = Vend.point()
-                local names = {}
-                for i, id in ipairs(Vend.Items) do
-                    if i > 4 then
-                        names[#names + 1] = "+" .. (#Vend.Items - 4)
-                        break
-                    end
-                    names[#names + 1] = itemName(id)
-                end
-                if not Vend.Running then Vend.refreshItems(false, list) end
-                txt = table.concat({
-                    "Status  : " .. (Vend.Running and "JALAN" or "BERHENTI") .. " - " .. Vend.Mode,
-                    "Item    : " .. ((#names > 0) and table.concat(names, ", ") or "semua item yang bisa dijual"),
-                    ("Vending : %d milikmu di world ini | isi %d | kosong %d"):format(#list, total, empty),
-                    "Titik   : " .. ((name ~= "" or door) and (name .. (door and (":" .. door) or "")) or "world ini")
-                        .. (Vend.DropX >= 0 and (" (" .. Vend.DropX .. "," .. Vend.DropY .. ")") or " (titik kedatangan)"),
-                    ("Hasil   : stock +%d | diambil %d | di-drop %d"):format(Vend.Stocked, Vend.Taken, Vend.Dropped),
-                    "Aksi    : " .. Vend.Status,
-                }, "\n")
-            else
-                txt = "Data world belum ketemu"
-            end
-            if UI.VendStatus and txt ~= Vend.Shown then
-                Vend.Shown = txt
-                pcall(function() UI.VendStatus:SetDesc(txt) end)
-            end
-            task.wait(1)
-        end
-    end)
-end)() end
-
--- ===== TAB: PABRIK =====
-do (function()
-    local PTab = makeTab("Pabrik", "factory", "farm")
-
-    safe(function()
-        UI.PabrikStatus = PTab:Paragraph({ Title = "Status Pabrik", Desc = "-" })
-    end)
-
-    local pCtl = box(PTab, "Kontrol", true)
-    local pBreak = box(PTab, "Posisi & tile break", true)
-    local pDrop = box(PTab, "Drop seed", true)
-
-    safe(function()
-        UI.PabrikToggle = pCtl:Toggle({
-            Title = "Jalankan Pabrik",
-            Desc = "Break -> tanam -> panen -> break lagi, seed lebihan di-drop",
-            Value = false,
-            Callback = function(on)
-                if on then Pabrik.start() elseif Pabrik.Running then Pabrik.stop() end
-            end,
-        })
-    end)
-
-    safe(function()
-        UI.PabrikSeedDropdown = pCtl:Dropdown({
-            Title = "Seed pabrik",
-            Desc = "Block-nya otomatis (contoh: Dirt Seed -> Dirt)",
-            Values = { "(memuat...)" },
-            Callback = function(opt)
-                local id = tonumber(string.match(opt or "", "%[(%d+)%]$"))
-                if id then Pabrik.SeedId = id end
-            end,
-        })
-    end)
-
-    safe(function()
-        pCtl:Toggle({
-            Title = "Tanam di seluruh world",
-            Desc = "Mati = hanya di lahan (tab Lahan)",
-            Value = Pabrik.WholeWorld,
-            Callback = function(on) Pabrik.WholeWorld = on end,
-        })
-    end)
-
-    safe(function()
-        pBreak:Button({
-            Title = "Pakai posisi sekarang untuk break",
-            Desc = "Berdiri di tempat break, lalu tekan",
-            Callback = function()
-                local x, y = Auto.here()
-                if not x then
-                    notify("Pabrik", "Kamu belum masuk world", 3)
-                    return
-                end
-                Pabrik.BreakX, Pabrik.BreakY = x, y
-                notify("Pabrik", ("Posisi break (%d,%d)"):format(x, y), 3)
-            end,
-        })
-    end)
-
-    safe(function()
-        pBreak:Button({
-            Title = "Pilih tile break (Grid)",
-            Desc = "Grid terbuka dalam mode Pabrik (terpisah dari tile Auto Farm)",
-            Callback = function()
-                if UI.setGridMode then UI.setGridMode("pabrik") end
-                if UI.GridGui then UI.GridGui.Enabled = true end
-            end,
-        })
-    end)
-
-    safe(function()
-        pDrop:Toggle({
-            Title = "Auto drop seed",
-            Desc = "Ke titik drop (tab Titik Drop)",
-            Value = Pabrik.Drop,
-            Callback = function(on) Pabrik.Drop = on end,
-        })
-    end)
-
-    addNumber(pDrop, {
-        Title = "Sisakan seed",
-        Desc = "Untuk ditanam lagi",
-        Min = 0, Max = 199, Step = 1, Default = Pabrik.Keep,
-        Callback = function(v) Pabrik.Keep = math.floor(v) end,
-    })
-
-    addNumber(pDrop, {
-        Title = "Drop kalau seed sudah",
-        Desc = "Contoh 200 & sisakan 50 = drop 150",
-        Min = 2, Max = 200, Step = 1, Default = Pabrik.DropAt,
-        Callback = function(v) Pabrik.DropAt = math.floor(v) end,
-    })
-
-    local function countKeys(t)
-        local n = 0
-        for _ in pairs(t) do n += 1 end
-        return n
-    end
-
-    task.spawn(function()
-        while alive() do
-            local seed, block = Pabrik.SeedId, Auto.blockOfSeed(Pabrik.SeedId)
-            local name, door = Auto.parseDropTarget()
-            local dropAt = (name ~= "" and name or "world ini") .. (door and (" pintu " .. door) or "")
-                .. (Pabrik.DropX >= 0 and (" (" .. Pabrik.DropX .. "," .. Pabrik.DropY .. ")") or "")
-            local txt = table.concat({
-                "Status : " .. (Pabrik.Running and ("JALAN - fase " .. tostring(Pabrik.Phase or "-")) or "BERHENTI"),
-                ("Seed   : %s x%d | block %s x%d"):format(seed and itemName(seed) or "-", seed and invCount(seed) or 0,
-                    block and itemName(block) or "-", block and invCount(block) or 0),
-                ("Break  : %s | tile %d"):format(Pabrik.BreakX >= 0 and ("(" .. Pabrik.BreakX .. "," .. Pabrik.BreakY .. ")")
-                    or "belum diatur", countKeys(Pabrik.Tiles)),
-                ("Drop   : %s | sisakan %d, drop saat >= %d"):format(Pabrik.Drop and dropAt or "mati", Pabrik.Keep, Pabrik.DropAt),
-                ("Hasil  : panen %d | tanam %d | di-drop %d"):format(Pabrik.Harvested, Pabrik.Planted, Pabrik.Dropped),
-                "Aksi   : " .. Pabrik.Status,
-            }, "\n")
-            if UI.PabrikStatus and txt ~= Pabrik.Shown then
-                Pabrik.Shown = txt
-                pcall(function() UI.PabrikStatus:SetDesc(txt) end)
-            end
-            -- tombol START di Grid (mode pabrik)
-            if UI.GridMode == "pabrik" and UI.GridStart then
-                UI.GridStart.Text = I18N.T(Pabrik.Running and "STOP PABRIK" or "START PABRIK")
-                UI.GridStart.BackgroundColor3 = Pabrik.Running and Color3.fromRGB(200, 60, 60) or Color3.fromRGB(46, 160, 90)
-            end
-            task.wait(1)
-        end
-    end)
-end)() end
-
----------------------------------------------------------------------
--- AUTO RECONNECT
----------------------------------------------------------------------
--- Cara kerja:
---   Terlempar dari world (event WorldClosed dari server):
---     catat aktivitas -> tunggu -> masuk world yang sama lagi -> lanjut aktivitas.
---   Disconnect dari server Roblox (layar error muncul):
---     catat aktivitas ke file -> teleport ulang ke game dengan data world
---     (game otomatis masuk world itu) -> script jalan lagi -> lanjut aktivitas.
---     Supaya script jalan lagi setelah teleport: isi URL script (queue_on_teleport)
---     atau taruh script di folder autoexec executor.
-local Rejoin = {
-    On = false,
-    World = true,       -- masuk lagi kalau terlempar dari world
-    Server = true,      -- rejoin kalau disconnect dari server
-    DelaySec = 5,
-    ScriptUrl = "",
-    Keep = false,       -- selalu kembali ke world tujuan kalau berada di luar world
-    Target = "",        -- world tujuan (kosong = world terakhir)
-    LastWorld = "",     -- world terakhir yang dimasuki
-    Last = nil,         -- catatan aktivitas terakhir
-    LastAt = 0,
-    Busy = false,
-    Count = 0,
-    Status = "-",
-}
-
-do (function()
-    local HttpService = game:GetService("HttpService")
-    local TeleportService = game:GetService("TeleportService")
-    local GuiService = game:GetService("GuiService")
-    local canFile = type(writefile) == "function" and type(readfile) == "function" and type(isfile) == "function"
-    local PENDING = "KzoyzOpus/rejoin_" .. tostring(LocalPlayer.UserId) .. ".json"
-
-    -- catat aktivitas selagi masih jalan
-    task.spawn(function()
-        while alive() do
-            local now = os.clock()
-            local wn = Guard.worldName and Guard.worldName() or ""
-            if wn ~= "" and not Pabrik.Traveling then Rejoin.LastWorld = wn end
-            if Guard.anyRunning and Guard.anyRunning() and Guard.Mode == "idle" then
-                Rejoin.Last = Guard.snapshot()
-                Rejoin.LastAt = now
-            elseif now - Rejoin.LastAt > 3 and Guard.Mode == "idle" and wn ~= "" then
-                -- masih di world tapi aktivitas dihentikan sendiri: jangan dilanjutkan
-                Rejoin.Last = nil
-            end
-            task.wait(1)
-        end
-    end)
-
-    local function resume(saved, reason)
-        Guard.afterEnter()
-        Rejoin.Count += 1
-        Rejoin.Status = "Masuk lagi berhasil, lanjut aktivitas"
-        notify("Auto Reconnect", reason .. ": lanjut aktivitas", 4)
-        Hook.send("rejoin", reason .. " ke " .. tostring(saved.world) .. ", aktivitas dilanjutkan")
-        Guard.resumeSaved(saved)
-    end
-
-    -- ===== terlempar dari world =====
-    local function onWorldClosed(msg)
-        if not (Rejoin.On and Rejoin.World) or Rejoin.Busy or Pabrik.Traveling then return end
-        if Guard.Mode == "away" or Guard.Mode == "out" then return end -- Penjaga yang keluar
-        local saved = Rejoin.Last
-        if not saved or saved.world == "" or os.clock() - Rejoin.LastAt > 10 then return end
-        Rejoin.Busy = true
-        task.spawn(function()
-            Guard.stopAll()
-            local text = tostring(msg or ""):gsub("`.", "")
-            Rejoin.Status = "Terlempar dari " .. saved.world .. ". Masuk lagi..."
-            Hook.send("rejoin", "Terlempar dari world " .. saved.world .. (text ~= "" and (" (" .. text .. ")") or ""))
-            task.wait(Rejoin.DelaySec + 1.5) -- tunggu animasi pintu selesai
-            for try = 1, 3 do
-                if not (alive() and Rejoin.On) then break end
-                local ok, err = Guard.enterWorld(saved.world)
-                if ok then
-                    task.wait(1.5)
-                    resume(saved, "Masuk lagi")
-                    Rejoin.Busy = false
-                    return
-                end
-                Rejoin.Status = ("Gagal masuk (%d/3): %s"):format(try, tostring(err))
-                task.wait(10)
-            end
-            Rejoin.Status = "Gagal masuk lagi ke " .. saved.world
-            notify("Auto Reconnect", Rejoin.Status, 5)
-            Hook.send("rejoin", Rejoin.Status)
-            Rejoin.Busy = false
-        end)
-    end
-
-    -- game v1159+: WorldClosed lewat paket Net (ByteNet), bukan RemoteEvent bernama lagi.
-    -- Net.on hanya MENDENGAR (tidak kirim apa pun ke server). Listener tidak bisa dilepas,
-    -- jadi dicek alive() supaya script lama yang sudah ditutup tidak ikut jalan.
-    local closedHooked = false
-    if NetOk and type(Net) == "table" and type(Net.on) == "function"
-        and type(Net.EVENTS) == "table" and Net.EVENTS.WorldClosed then
-        closedHooked = pcall(Net.on, "WorldClosed", function(msg)
-            if alive() then onWorldClosed(msg) end
-        end, function()
-            local w = Refs.World
-            return w and rawget(w, "name") or ""
-        end)
-    end
-    if not closedHooked then
-        local closed = WorldRemotes:FindFirstChild("WorldClosed")
-        if closed and closed:IsA("RemoteEvent") then
-            table.insert(Connections, closed.OnClientEvent:Connect(function(msg)
-                if alive() then onWorldClosed(msg) end
-            end))
-        end
-    end
-
-    -- ===== rejoin manual & selalu kembali ke world =====
-    -- Cara kerja:
-    --   Rejoin manual : catat aktivitas -> keluar world -> masuk lagi -> lanjut aktivitas.
-    --   Selalu kembali: tiap 2 detik cek, kalau kamu di luar world (layar pilih world)
-    --                   lebih lama dari jeda -> masuk ke world tujuan -> lanjut aktivitas.
-    function Rejoin.targetWorld()
-        local t = tostring(Rejoin.Target or ""):upper():gsub("[^A-Z0-9]", "")
-        if t ~= "" then return t end
-        return Rejoin.LastWorld or ""
-    end
-
-    local function enterAndResume(world, saved, reason)
-        for try = 1, 3 do
-            if not alive() then return false end
-            local ok, err = Guard.enterWorld(world)
-            if ok then
-                task.wait(1.5)
-                if saved and saved.world == world then
-                    resume(saved, reason)
-                else
-                    Guard.afterEnter()
-                    Rejoin.Count += 1
-                    Rejoin.Status = reason .. " ke " .. world .. " berhasil"
-                    Hook.send("rejoin", reason .. " ke " .. world)
-                end
-                return true
-            end
-            Rejoin.Status = ("Gagal masuk %s (%d/3): %s"):format(world, try, tostring(err))
-            task.wait(8)
-        end
-        notify("Auto Rejoin", "Gagal masuk " .. world, 5)
-        Hook.send("rejoin", "Gagal masuk " .. world)
-        return false
-    end
-
-    function Rejoin.now()
-        if Rejoin.Busy then
-            notify("Auto Rejoin", "Sedang proses masuk world, tunggu dulu", 3)
-            return
-        end
-        local world = Rejoin.targetWorld()
-        if world == "" then
-            notify("Auto Rejoin", "World tujuan belum ada. Isi 'World tujuan' atau masuk world dulu", 4)
-            return
-        end
-        Rejoin.Busy = true
-        task.spawn(function()
-            local saved = nil
-            if Guard.worldName() ~= "" then
-                if Guard.anyRunning() then saved = Guard.snapshot() end
-                Guard.stopAll()
-                Rejoin.Status = "Keluar world..."
-                if not Guard.leaveWorld() then
-                    Rejoin.Status = "Gagal keluar world"
-                    notify("Auto Rejoin", Rejoin.Status, 4)
-                    Rejoin.Busy = false
-                    return
-                end
-                task.wait(math.max(2, Rejoin.DelaySec))
-            end
-            if saved and saved.world ~= world then saved = nil end -- world lain: aktivitas tidak dilanjutkan
-            Rejoin.Status = "Masuk ke " .. world .. "..."
-            enterAndResume(world, saved, "Rejoin")
-            Rejoin.Busy = false
-        end)
-    end
-
-    task.spawn(function()
-        local outSince = nil
-        while alive() do
-            task.wait(2)
-            local out = Guard.worldName() == ""
-            local free = Rejoin.On and Rejoin.Keep and not Rejoin.Busy and not Rejoin.Leaving and not Pabrik.Traveling
-                and Guard.Mode == "idle"
-            if not (out and free) then
-                outSince = nil
-            else
-                outSince = outSince or os.clock()
-                local world = Rejoin.targetWorld()
-                if world ~= "" and os.clock() - outSince >= Rejoin.DelaySec then
-                    outSince = nil
-                    Rejoin.Busy = true
-                    local saved = Rejoin.Last
-                    if saved and (saved.world ~= world or os.clock() - Rejoin.LastAt > 600) then saved = nil end
-                    Rejoin.Status = "Di luar world, masuk ke " .. world .. "..."
-                    enterAndResume(world, saved, "Kembali otomatis")
-                    Rejoin.Busy = false
-                end
-            end
-        end
-    end)
-
-    -- ===== disconnect dari server =====
-    local function queueScript()
-        local q = queue_on_teleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport)
-        local url = tostring(Rejoin.ScriptUrl or "")
-        if type(q) == "function" and string.sub(url, 1, 8) == "https://" then
-            pcall(q, ("loadstring(game:HttpGet(%q))()"):format(url))
-            return true
-        end
-        return false
-    end
-
-    local function onDisconnect(msg)
-        if not (Rejoin.On and Rejoin.Server) or Rejoin.Leaving then return end
-        Rejoin.Leaving = true
-        local saved = Rejoin.Last or (Guard.anyRunning() and Guard.snapshot()) or nil
-        local world = saved and saved.world or Guard.worldName()
-        if canFile and saved then
-            local data = {
-                world = saved.world, farm = saved.farm, clear = saved.clear, farmer = saved.farmer,
-                spam = saved.spam, splice = saved.splice, pabrik = saved.pabrik, build = saved.build,
-                tx = saved.tx, ty = saved.ty, at = os.time(),
-            }
-            pcall(function() writefile(PENDING, HttpService:JSONEncode(data)) end)
-        end
-        local queued = queueScript()
-        Rejoin.Status = "Disconnect: rejoin..." .. (queued and "" or " (script tidak di-queue)")
-        Hook.send("rejoin", "Disconnect dari server (" .. tostring(msg) .. "). Rejoin ke " .. (world ~= "" and world or "game"))
-        task.spawn(function()
-            task.wait(Rejoin.DelaySec)
-            while alive() do
-                pcall(function()
-                    TeleportService:Teleport(game.PlaceId, LocalPlayer, (world ~= "") and { world = world } or nil)
-                end)
-                task.wait(15) -- belum pindah: coba lagi
-            end
-        end)
-    end
-
-    pcall(function()
-        table.insert(Connections, GuiService.ErrorMessageChanged:Connect(function(msg)
-            if alive() and type(msg) == "string" and msg ~= "" then onDisconnect(msg) end
-        end))
-    end)
-
-    -- ===== setelah execute: lanjutkan dari catatan rejoin =====
-    function Rejoin.startup(reconnectFn)
-        if not canFile then return end
-        local okE, has = pcall(isfile, PENDING)
-        if not okE or not has then return end
-        local okR, raw = pcall(readfile, PENDING)
-        if type(delfile) == "function" then pcall(delfile, PENDING) end
-        if not okR or type(raw) ~= "string" then return end
-        local okD, saved = pcall(HttpService.JSONDecode, HttpService, raw)
-        if not okD or type(saved) ~= "table" or type(saved.world) ~= "string" or saved.world == "" then return end
-        if os.time() - (tonumber(saved.at) or 0) > 15 * 60 then return end -- terlalu lama
-        Rejoin.Busy = true
-        Rejoin.Status = "Rejoin: menunggu masuk " .. saved.world
-        -- tunggu game masuk world (lewat data teleport); kalau tidak, masuk sendiri
-        local t0 = os.clock()
-        local tried = false
-        while alive() and os.clock() - t0 < 60 do
-            if Refs.World and Guard.worldName() == saved.world and Auto.here() then break end
-            if not Refs.World then pcall(reconnectFn) end
-            if Refs.World and not tried and os.clock() - t0 > 12 then
-                tried = true
-                Guard.enterWorld(saved.world)
-            end
-            task.wait(2)
-        end
-        if alive() and Guard.worldName() == saved.world then
-            pcall(reconnectFn)
-            task.wait(1)
-            resume(saved, "Rejoin server")
-        else
-            Rejoin.Status = "Rejoin: gagal masuk " .. saved.world
-            Hook.send("rejoin", Rejoin.Status)
-        end
-        Rejoin.Busy = false
-    end
-end)() end
-
-Config.add("Reconnect", Rejoin, { "On", "World", "Server", "DelaySec", "ScriptUrl", "Keep", "Target" })
-Config.add("Discord", Hook, { "On", "Url", "Penjaga", "Stop", "Full", "Bonus", "Rejoin", "Pabrik", "ReportMin" })
-
--- ===== TAB: TITIK DROP (dipakai Pabrik, Farmer, Auto Farm) =====
-do (function()
-    local DTab = makeTab("Titik Drop", "map-pin", "farm")
-
-    safe(function()
-        UI.DropPointStatus = DTab:Paragraph({ Title = "Titik Drop", Desc = "-" })
-    end)
-
-    local dBox = box(DTab, "Atur titik drop", true)
-
-    safe(function()
-        UI.DropWorldInput = dBox:Input({
-            Title = "World drop",
-            Desc = "Kosong = world ini | WORLD | WORLD:ID (masuk lewat pintu ID)",
-            Value = Pabrik.DropWorld,
-            Placeholder = "STORAGE:1",
-            Callback = function(t) Pabrik.DropWorld = tostring(t or "") end,
-        })
-    end)
-
-    safe(function()
-        dBox:Button({
-            Title = "Pakai posisi sekarang untuk drop",
-            Desc = "Berdiri di tempat drop (boleh di world lain), lalu tekan",
-            Callback = function()
-                local x, y = Auto.here()
-                if not x then
-                    notify("Titik Drop", "Kamu belum masuk world", 3)
-                    return
-                end
-                Pabrik.DropX, Pabrik.DropY = x, y
-                -- world ikut diisi, kecuali sudah pakai format WORLD:ID
-                if not string.find(Pabrik.DropWorld or "", ":", 1, true) then
-                    Pabrik.DropWorld = Guard.worldName()
-                    if UI.DropWorldInput then pcall(function() UI.DropWorldInput:Set(Pabrik.DropWorld) end) end
-                end
-                notify("Titik Drop", ("Posisi drop (%d,%d) di %s"):format(x, y, Pabrik.DropWorld), 4)
-            end,
-        })
-    end)
-
-    safe(function()
-        dBox:Button({
-            Title = "Hapus posisi drop",
-            Desc = "Drop di titik kedatangan (pintu) saja",
-            Callback = function()
-                Pabrik.DropX, Pabrik.DropY = -1, -1
-                notify("Titik Drop", "Posisi drop dihapus", 3)
-            end,
-        })
-    end)
-
-    task.spawn(function()
-        while alive() do
-            local name, door = Auto.parseDropTarget()
-            local here = Guard.worldName()
-            local point
-            if Pabrik.DropX < 0 and not door and (name == "" or name == here) then
-                point = "belum diatur"
-            else
-                point = (name ~= "" and name or "world ini") .. (door and (" pintu " .. door) or "")
-                    .. (Pabrik.DropX >= 0 and (" (" .. Pabrik.DropX .. "," .. Pabrik.DropY .. ")") or " (titik kedatangan)")
-            end
-            local txt = table.concat({
-                "Titik  : " .. point,
-                "Dipakai: Pabrik (seed), Farmer & Auto Farm (otomatis saat item ~190)",
-                ("Di-drop: Pabrik %d | Farmer %d | Auto Farm %d"):format(Pabrik.Dropped, Farmer.Dropped, State.Dropped),
-                "Catatan: drop di titik ini tidak di-collect lagi",
-            }, "\n")
-            if UI.DropPointStatus and txt ~= UI.DropPointShown then
-                UI.DropPointShown = txt
-                pcall(function() UI.DropPointStatus:SetDesc(txt) end)
-            end
-            task.wait(1)
-        end
-    end)
-end)() end
-
--- ===== TAB: KONEKSI =====
-local ConnTab = makeTab("Koneksi", "plug", "setel")
-
-safe(function()
-    UI.RefInfo = ConnTab:Paragraph({ Title = "Referensi game", Desc = "-" })
-end)
-
-Box.ConnMain = box(ConnTab, "Koneksi", true)
-Box.ConnCfg = box(ConnTab, "Config", true)
-Box.ConnCalib = box(ConnTab, "Koreksi posisi", false)
-Box.ConnLang = box(ConnTab, "Bahasa / Language", false)
-
-local function reconnect(show)
-    -- hentikan Clear / Farmer dulu
-    if Clear.Running then stopClear("Dihentikan: hubungkan ulang ke game") end
-    if Farmer.Running then stopFarmer("Dihentikan: hubungkan ulang ke game") end
-    Auto.resetReach()
-    -- 1) cari isi tas cepat lalu langsung isi dropdown (tidak menunggu scan getgc yang lama)
-    if pcall(Anim.quickRefs) and Refs.Inv then
-        UI.checkInventory(true, true)
-        task.wait() -- biar dropdown tampil dulu sebelum scan lengkap (scan menahan layar sebentar)
-    end
-    -- 2) scan lengkap
-    findRefs()
-    AutoInput.bindMenu()
-    watchInventory()
-    UI.checkInventory(true, true) -- langsung di thread ini (thread INIT / antrian UI), bukan thread tombol
-    findDropRefs(true)
-    Drops.LastError = nil
-    Auto.findTreeRefs()
-    table.clear(DropFailUntil)
-    Anim.fn, Anim.idx = nil, nil
-    pcall(Anim.findFast)
-    if State.LiteMode then setLite(true) end
-    if Misc.InfJump then hookJammer() end
-    pcall(function() UI.RefInfo:SetDesc(refsText()) end)
-    updateStatus()
-    if show then notify(show, refsText(), 5) end
-end
-
-safe(function()
-    Box.ConnMain:Button({
-        Title = "Hubungkan ke game",
-        Desc = "Pakai setelah pindah world",
-        Callback = function()
-            UI.later("reconnect", function() reconnect("Koneksi") end)
-        end,
-    })
-end)
-
-safe(function()
-    UI.ConfigStatus = Box.ConnCfg:Paragraph({ Title = "Status", Desc = Config.Status })
-end)
-
-safe(function()
-    Box.ConnCfg:Toggle({
-        Title = "Auto Save Config",
-        Desc = "Simpan pengaturan otomatis, dimuat lagi saat execute",
-        Value = Config.AutoSave,
-        Callback = function(on)
-            Config.AutoSave = on
-            Config.save(true) -- simpan pilihan ini juga
-        end,
-    })
-end)
-
-safe(function()
-    Box.ConnCfg:Button({
-        Title = "Simpan config sekarang",
-        Callback = function()
-            local ok = Config.save(true)
-            notify("Config", ok and "Tersimpan" or Config.Status, 3)
-        end,
-    })
-end)
-
-safe(function()
-    Box.ConnCfg:Button({
-        Title = "Reset config (default)",
-        Desc = "Hapus file config, lalu execute ulang",
-        Callback = function()
-            Config.reset()
-            notify("Config", Config.Status, 4)
-        end,
-    })
-end)
-
-safe(function()
-    Box.ConnLang:Dropdown({
-        Title = "Bahasa / Language",
-        Desc = "Ganti bahasa, lalu execute ulang",
-        Values = { "Indonesia", "English" },
-        Value = I18N.Saved == "en" and "English" or "Indonesia",
-        Callback = function(v)
-            local lang = (v == "English") and "en" or "id"
-            if lang == I18N.Saved then return end
-            I18N.Saved = lang
-            Config.save(true)
-            notify("Bahasa / Language", "Execute ulang untuk ganti bahasa / Re-execute to apply", 5)
-        end,
-    })
-end)
-
-safe(function()
-    Box.ConnLang:Toggle({
-        Title = "Tanya bahasa saat execute",
-        Desc = "Munculkan pilihan bahasa tiap execute",
-        Value = I18N.Ask,
-        Callback = function(on) I18N.Ask = on end,
-    })
-end)
-
-safe(function()
-    Box.ConnCalib:Input({
-        Title = "Koreksi posisi X",
-        Desc = "Isi 1 / -1 kalau tile meleset",
-        Value = tostring(State.CalibX),
-        Callback = function(text) State.CalibX = tonumber(text) or 0 end,
-    })
-end)
-
-safe(function()
-    Box.ConnCalib:Input({
-        Title = "Koreksi posisi Y",
-        Value = tostring(State.CalibY),
-        Callback = function(text) State.CalibY = tonumber(text) or 0 end,
-    })
-end)
-
--- ===== KONEKSI: AUTO RECONNECT =====
-do (function()
-    local rBox = box(ConnTab, "Auto Reconnect", false)
-
-    safe(function()
-        UI.RejoinStatus = rBox:Paragraph({ Title = "Status", Desc = Rejoin.Status })
-    end)
-
-    safe(function()
-        rBox:Toggle({
-            Title = "Auto Reconnect",
-            Desc = "Masuk lagi & lanjut aktivitas kalau terlempar",
-            Value = Rejoin.On,
-            Callback = function(on) Rejoin.On = on end,
-        })
-    end)
-
-    safe(function()
-        rBox:Toggle({
-            Title = "Terlempar dari world",
-            Desc = "World ditutup / di-kick: masuk lagi ke world yang sama",
-            Value = Rejoin.World,
-            Callback = function(on) Rejoin.World = on end,
-        })
-    end)
-
-    safe(function()
-        rBox:Toggle({
-            Title = "Selalu kembali ke world",
-            Desc = "Kalau berada di luar world (layar pilih world), masuk lagi otomatis",
-            Value = Rejoin.Keep,
-            Callback = function(on) Rejoin.Keep = on end,
-        })
-    end)
-
-    safe(function()
-        rBox:Input({
-            Title = "World tujuan",
-            Desc = "Kosongkan = world terakhir yang kamu masuki",
-            Value = Rejoin.Target,
-            Placeholder = "NAMAWORLD",
-            Callback = function(text) Rejoin.Target = tostring(text or "") end,
-        })
-    end)
-
-    safe(function()
-        rBox:Button({
-            Title = "Rejoin world sekarang",
-            Desc = "Keluar lalu masuk lagi, aktivitas dilanjutkan",
-            Callback = function() Rejoin.now() end,
-        })
-    end)
-
-    safe(function()
-        rBox:Toggle({
-            Title = "Disconnect dari server",
-            Desc = "Teleport ulang ke game lalu masuk world terakhir",
-            Value = Rejoin.Server,
-            Callback = function(on) Rejoin.Server = on end,
-        })
-    end)
-
-    addNumber(rBox, {
-        Title = "Jeda sebelum masuk lagi (detik)",
-        Min = 2, Max = 60, Step = 1, Default = Rejoin.DelaySec,
-        Callback = function(v) Rejoin.DelaySec = math.floor(v) end,
-    })
-
-    safe(function()
-        rBox:Input({
-            Title = "URL script (untuk rejoin server)",
-            Desc = "Link raw script ini, supaya jalan lagi setelah teleport. Kosong = pakai autoexec",
-            Value = Rejoin.ScriptUrl,
-            Placeholder = "https://...",
-            Callback = function(text)
-                Rejoin.ScriptUrl = tostring(text or ""):gsub("^%s+", ""):gsub("%s+$", "")
-            end,
-        })
-    end)
-end)() end
-
--- ===== TAB: DISCORD =====
-do (function()
-    local DcTab = makeTab("Discord", "bell", "setel")
-
-    safe(function()
-        UI.HookStatus = DcTab:Paragraph({ Title = "Status", Desc = Hook.Status })
-    end)
-
-    local dMain = box(DcTab, "Webhook", true)
-    local dWhat = box(DcTab, "Yang dikirim", false)
-
-    safe(function()
-        dMain:Toggle({
-            Title = "Notifikasi Discord",
-            Desc = "Kirim kabar penting ke channel Discord kamu",
-            Value = Hook.On,
-            Callback = function(on) Hook.On = on end,
-        })
-    end)
-
-    safe(function()
-        dMain:Input({
-            Title = "URL Webhook",
-            Desc = "Channel Discord > Edit > Integrasi > Webhook > Salin URL",
-            Value = Hook.Url,
-            Placeholder = "https://discord.com/api/webhooks/...",
-            Callback = function(text)
-                text = tostring(text or ""):gsub("^%s+", ""):gsub("%s+$", "")
-                Hook.Url = text
-                if text ~= "" and not Hook.valid(text) then
-                    notify("Discord", "URL webhook tidak valid", 4)
-                end
-            end,
-        })
-    end)
-
-    safe(function()
-        dMain:Button({
-            Title = "Tes kirim",
-            Callback = function()
-                if not Hook.valid(Hook.Url) then
-                    notify("Discord", "Isi URL webhook dulu", 3)
-                    return
-                end
-                local was = Hook.On
-                Hook.On = true
-                Hook.send("test", "Tes notifikasi dari Zekio supreme")
-                Hook.On = was
-                notify("Discord", "Pesan tes masuk antrian", 3)
-            end,
-        })
-    end)
-
-    addNumber(dMain, {
-        Title = "Laporan statistik (menit)",
-        Desc = "Kirim statistik sesi tiap X menit. 0 = mati",
-        Min = 0, Max = 180, Step = 5, Default = Hook.ReportMin,
-        Callback = function(v) Hook.ReportMin = math.floor(v) end,
-    })
-
-    for _, item in ipairs({
-        { "Penjaga", "Mod / Dev / pemain masuk world" },
-        { "Stop", "Aktivitas berhenti (block habis / error)" },
-        { "Full", "Inventori penuh" },
-        { "Bonus", "Quest diklaim / redeem berhasil" },
-        { "Rejoin", "Terlempar / disconnect / masuk lagi" },
-        { "Pabrik", "Pabrik drop seed / lahan selesai / berhenti" },
-    }) do
-        safe(function()
-            dWhat:Toggle({
-                Title = item[2],
-                Value = Hook[item[1]],
-                Callback = function(on) Hook[item[1]] = on end,
-            })
-        end)
-    end
-end)() end
-
-
----------------------------------------------------------------------
--- INIT
----------------------------------------------------------------------
--- Thread pekerjaan UI: dibuat di sini (sama seperti thread status yang terbukti bisa mengubah UI).
--- Callback tombol / event game di sebagian executor tidak punya izin mengubah dropdown.
-do
-    task.spawn(function()
-        while alive() do
-            local ok, err = pcall(UI.runJobs)
-            if not ok then warn("[Zekio supreme] UI runner: " .. tostring(err)) end
-            task.wait(0.1)
-        end
-    end)
-end
-
-task.spawn(function()
-    reconnect("Zekio supreme v5.2")
-    -- Penjaga dari config dinyalakan setelah data pemain ketemu
-    -- (supaya pemain yang sudah ada dicatat dulu)
-    if Config.saved("Penjaga", "On") == true and alive() then
-        if UI.GuardToggle then pcall(function() UI.GuardToggle:Set(true) end) end
-        if not Guard.On then Guard.set(true) end
-    end
-    Config.start()
-    -- habis rejoin server: lanjutkan aktivitas sebelumnya
-    Rejoin.startup(reconnect)
-end)
-
-task.spawn(function()
-    while alive() do
-        if not State.Running then updateStatus() end
-        Auto.updateClearStatus()
-        Auto.updateFarmerStatus()
-        updateSpamStatus()
-        if UI.TeleportStatus and Auto.Teleport then
-            local text = Auto.Teleport.text()
-            if text ~= Auto.Teleport.Shown then
-                Auto.Teleport.Shown = text
-                pcall(function() UI.TeleportStatus:SetDesc(text) end)
-            end
-        end
-        if UI.ConfigStatus and Config.Status ~= Config.Shown then
-            Config.Shown = Config.Status
-            pcall(function() UI.ConfigStatus:SetDesc(Config.Status) end)
-        end
-        local rj = ("%s\nWorld tujuan: %s\nBerhasil masuk lagi: %d kali"):format(
-            Rejoin.Status, (Rejoin.targetWorld and Rejoin.targetWorld() ~= "") and Rejoin.targetWorld() or "-", Rejoin.Count)
-        if UI.RejoinStatus and rj ~= Rejoin.Shown then
-            Rejoin.Shown = rj
-            pcall(function() UI.RejoinStatus:SetDesc(rj) end)
-        end
-        local hk = ("%s\nAntrian: %d pesan"):format(Hook.Status, #Hook.Queue)
-        if UI.HookStatus and hk ~= Hook.Shown then
-            Hook.Shown = hk
-            pcall(function() UI.HookStatus:SetDesc(hk) end)
-        end
-        task.wait(1)
-    end
-end)
-
----------------------------------------------------------------------
--- CLEANUP (otomatis saat script dijalankan ulang)
----------------------------------------------------------------------
-Session.Cleanup = function()
-    State.Running = false
-    Clear.Running = false
-    Farmer.Running = false
-    Spam.On = false
-    if Config.AutoSave then pcall(Config.save, false) end -- simpan sebelum ditutup
-    Guard.On = false
-    Bonus.Quest, Bonus.Redeem = false, false
-    Scan.Auto = false
-    Splice.Running = false
-    Rejoin.On = false
-    Pabrik.Running = false
-    Build.Running = false
-    State.Override = nil
-    pcall(Auto.stopWalk)
-    AutoInput.active = false
-    pcall(Auto.releaseInput)
-    for _, c in ipairs(Connections) do pcall(function() c:Disconnect() end) end
-    -- kembalikan nama asli (watermark dilepas)
-    Misc.CustomName = false
-    pcall(nameRestore)
-    -- kembalikan fungsi game ke asal
-    pcall(setLite, false)
-    pcall(unhookJammer)
-    AutoInput.unbindMenu()
-    if Refs.World then
-        if Misc.Ghost then pcall(function() Refs.World.ghost = false end) end
-        if Misc.Speed ~= 100 then pcall(function() Refs.World.speedScale = 1 end) end
-    end
-    pcall(function() GridGui:Destroy() end)
-    pcall(function() FlyPad:Destroy() end)
-    pcall(function() Window:Destroy() end)
-end
+-- Zekio supreme | MAIN v5.9.21 | packed r2
+return(function(...)
+local _a="0l3tHQdUs+6mNW7IL9oV2exagnYhKXui4CASO/kMBbTjwPRfqEpDZ85Gr1ycvzFJ"
+local _b=[[
+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
+sTQgCIMziUFNKu432+0f5bClpm4SYIoS8VGmcL==
+]]
+local _c,_d,_e,_f,_g,_h={},{},0,0,4244998734,0 local _i,_j,_k={},258,nil local _l,_m,_n,_o={},0,1,0 local function _p(_q) error("Zekio supreme: payload ".._q,0) end for _q=1,64 do _c[string.byte(_a,_q)]=_q-1 end local function _r(_s) if _s==256 then _i={};_j=258;_k=nil;return end if _s==257 then _h=1;return end local _t if _s<256 then _t=string.char(_s) elseif _s<_j then _t=_i[_s] elseif _s==_j and _k then _t=_k..string.sub(_k,1,1) end if not _t then _p("invalid code") end _m=_m+#_t if _m>556811 then _p("invalid length") end _l[#_l+1]=_t for _u=1,#_t do _n=(_n+string.byte(_t,_u))%65521 _o=(_o+_n)%65521 end if _k and _j<65536 then _i[_j]=_k..string.sub(_t,1,1);_j=_j+1 end _k=_t end local _v=nil for _q=1,#_b do local _w=string.byte(_b,_q) local _x=_c[_w] if _x~=nil then _e=_e*64+_x;_f=_f+6 if _f>=8 then _f=_f-8 local _y=math.floor(_e/2^_f) _e=_e%2^_f _g=(_g*1664525+1013904223)%4294967296 _y=(_y-math.floor(_g/16777216))%256 if _v==nil then _v=_y else if _h==1 then _p("trailing data") end _r(_v*256+_y);_v=nil end end elseif _w~=61 and _w~=10 and _w~=13 and _w~=32 then _p("invalid alphabet") end end if _h~=1 or _v~=nil or _m~=556811 or _o*65536+_n~=675974061 then _p("failed integrity check") end _b=nil;_i=nil;_c=nil local _z=table.concat(_l);_l=nil if type(loadstring)~="function" then error("Zekio supreme: loadstring tidak tersedia",0) end local _aa,_ab=loadstring(_z,"=Zekio supreme") _z=nil if not _aa then error("Zekio supreme: "..tostring(_ab),0) end return _aa(...) end)(...)
