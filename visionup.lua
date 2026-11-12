@@ -1,4 +1,3 @@
-
 local G = (getgenv and getgenv()) or _G
 for _, key in ipairs({ "__KzoyzOpus", "__GTFarm" }) do -- __GTFarm = nama versi lama
     if G[key] and G[key].Cleanup then pcall(G[key].Cleanup) end
@@ -34,18 +33,83 @@ local UserInputService = game:GetService("UserInputService")
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
-local Shared = ReplicatedStorage:WaitForChild("Shared")
-local WorldRemotes = ReplicatedStorage:WaitForChild("WorldRemotes")
+-- PERBAIKAN: dulu memakai WaitForChild("Shared") TANPA batas waktu. Kalau folder itu tidak ada
+-- (game update / diganti nama / dipindah), script menggantung selamanya dan Roblox hanya
+-- menulis "Infinite yield possible" -- UI tidak pernah muncul. Sekarang: tunggu paling lama
+-- 20 detik, cari folder modul game di tempat lain, dan kalau tetap tidak ada, berhenti dengan
+-- pesan error yang jelas + daftar isi ReplicatedStorage (untuk diagnosa).
+function Session.waitFor(parent, name, timeout)
+    local found = parent:FindFirstChild(name)
+    if found then return found end
+    local ok, res = pcall(parent.WaitForChild, parent, name, timeout)
+    if ok then return res end
+    return nil
+end
+
+local Shared, WorldRemotes
+do -- blok sendiri: tidak menambah variabel local di level file (batas 200)
+    local function hasCore(folder)
+        return typeof(folder) == "Instance"
+            and folder:FindFirstChild("ItemDB") ~= nil
+            and folder:FindFirstChild("Inventory") ~= nil
+    end
+    local roots = {
+        ReplicatedStorage,
+        game:GetService("ReplicatedFirst"),
+        LocalPlayer:FindFirstChild("PlayerScripts"),
+    }
+    local function find()
+        local direct = ReplicatedStorage:FindFirstChild("Shared")
+        if hasCore(direct) then return direct end
+        -- folder mungkin diganti nama / dipindah: cari folder yang berisi ItemDB + Inventory
+        for _, root in ipairs(roots) do
+            for _, d in ipairs(root:GetDescendants()) do
+                if d.Name == "ItemDB" and d:IsA("ModuleScript") and hasCore(d.Parent) then
+                    return d.Parent
+                end
+            end
+        end
+        return nil
+    end
+    local deadline = os.clock() + 20
+    while true do
+        Shared = find()
+        if Shared or os.clock() >= deadline then break end
+        task.wait(1)
+    end
+    if not Shared then
+        local lines = {}
+        for _, c in ipairs(ReplicatedStorage:GetChildren()) do
+            local kids = {}
+            for i, k in ipairs(c:GetChildren()) do
+                if i > 15 then kids[#kids + 1] = "..."; break end
+                kids[#kids + 1] = k.Name
+            end
+            lines[#lines + 1] = ("  - %s [%s]%s"):format(c.Name, c.ClassName,
+                #kids > 0 and (": " .. table.concat(kids, ", ")) or "")
+        end
+        warn("[Vision Up] Isi ReplicatedStorage:\n" .. table.concat(lines, "\n"))
+        error("[Vision Up] Folder modul game (berisi ItemDB & Inventory) tidak ditemukan setelah 20 detik. "
+            .. "Kemungkinan game sudah update dan struktur modulnya berubah. "
+            .. "Salin daftar 'Isi ReplicatedStorage' di atas untuk menyesuaikan script.", 0)
+    end
+    -- WorldRemotes hanya dipakai game lama (sebelum ByteNet): opsional.
+    -- Folder kosong sebagai pengganti supaya :FindFirstChild / :GetChildren di bawah tetap aman.
+    WorldRemotes = Session.waitFor(ReplicatedStorage, "WorldRemotes", 5) or Instance.new("Folder")
+end
 -- Remote lama (versi game sebelum ByteNet). Hanya dipakai kalau fungsi baru tidak ada.
 local SetTileRemote = WorldRemotes:FindFirstChild("SetTile")
 
 local ItemDB = require(Shared.ItemDB)
 local InventoryModule = require(Shared.Inventory)
-local NetOk, Net = pcall(require, Shared.Net)
+local NetOk, Net = pcall(require, Shared:FindFirstChild("Net")) -- FindFirstChild: tidak error kalau modul tidak ada
 
-local GameGui = PlayerGui:WaitForChild("GameGui")
-local ParticlesOk, ParticlesModule = pcall(require, GameGui:WaitForChild("Particles"))
-local MenuModOk, MenuModule = pcall(require, GameGui:WaitForChild("WorldMenu"))
+local GameGui = Session.waitFor(PlayerGui, "GameGui", 20)
+if not GameGui then
+    error("[Vision Up] PlayerGui.GameGui tidak ditemukan setelah 20 detik (belum masuk world, atau game berubah)", 0)
+end
+local ParticlesOk, ParticlesModule = pcall(require, Session.waitFor(GameGui, "Particles", 5))
+local MenuModOk, MenuModule = pcall(require, Session.waitFor(GameGui, "WorldMenu", 5))
 local RolesOk, RolesModule = pcall(require, Shared:FindFirstChild("Roles"))
 local SfxOk, SfxModule = pcall(require, Shared:FindFirstChild("Sfx"))
 
