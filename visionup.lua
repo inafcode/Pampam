@@ -1,4 +1,4 @@
-﻿
+
 local G = (getgenv and getgenv()) or _G
 for _, key in ipairs({ "__KzoyzOpus", "__GTFarm" }) do -- __GTFarm = nama versi lama
     if G[key] and G[key].Cleanup then pcall(G[key].Cleanup) end
