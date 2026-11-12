@@ -50,7 +50,7 @@ local RolesOk, RolesModule = pcall(require, Shared:FindFirstChild("Roles"))
 local SfxOk, SfxModule = pcall(require, Shared:FindFirstChild("Sfx"))
 
 local WindUI = loadstring(game:HttpGet(
-    "https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"
+    "https://raw.githubusercontent.com/Footagesus/WindUI/d2c9bac5f96f997418d680d19cb759892542e492/dist/main.lua"
 ))()
 
 ---------------------------------------------------------------------
