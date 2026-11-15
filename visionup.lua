@@ -411,14 +411,6 @@ end)()
 ---------------------------------------------------------------------
 -- PENGATURAN & DATA
 ---------------------------------------------------------------------
--- ===== DATA FITUR: JALAN SAAT FARM =====
-local Walk = {
-    Enabled = false,      -- nyala/mati saat farm
-    Dir = "Kanan",        -- "Kanan" atau "Kiri"
-    HoldMs = 400,         -- durasi tekan (ms)
-    WaitMs = 200,         -- durasi tunggu (ms)
-}
-
 local State = {
     Running = false,
     Mode = "Place + Break",       -- "Place + Break" | "Break saja" | "Place saja"
@@ -3505,7 +3497,6 @@ local function farmLoop(runId)
         return State.Running and alive() and State.RunId == runId and Refs.World == world
             and world.fg == grid and rawget(world, "name") == worldName and not State.DropPause
     end
-    
     while State.Running and alive() and State.RunId == runId do
         if State.DropPause then pausedForDrop = true; task.wait(0.2); continue end
         if Refs.World ~= world or not world or world.fg ~= grid or rawget(world, "name") ~= worldName then
@@ -3517,69 +3508,11 @@ local function farmLoop(runId)
             else stopFarm("World berubah; mulai Auto Farm lagi di world tujuan"); return end
         end
         pausedForDrop = false
-        
         local doPlace, doBreak = farmMode() ~= "Break saja", farmMode() ~= "Place saja"
         local px, py = getPlayerTile()
         if not px then stopFarm("Karakter tidak ditemukan (keluar world?)"); return end
-        
         local tiles = {}
         for _, o in ipairs(sortedOffsets()) do tiles[#tiles + 1] = { x = px + o.dx, y = py + o.dy } end
-
-        -- Cek apakah masih ada block yang bisa di-break (hanya cek foreground/fg)
-        local hasBreakable = false
-        for _, t in ipairs(tiles) do
-            local fg = tileAt("fg", t.x, t.y)
-            if fg and fg ~= 0 and canBreak(fg) then
-                hasBreakable = true
-                break
-            end
-        end
-
-        -- ===== SENSOR PINTAR: CARI BLOCK & JALAN OTOMATIS =====
-        if Walk.Enabled and not hasBreakable and not doPlace then
-            local targetX, targetY = nil, nil
-            local minDist = 999
-
-            -- 1. Cari block terdekat di sekitar Grid
-            for _, o in ipairs(sortedOffsets()) do
-                local tx, ty = px + o.dx, py + o.dy
-                local fg = tileAt("fg", tx, ty)
-                -- Jika ada block yang bisa dipecah
-                if fg and fg ~= 0 and canBreak(fg) then
-                    local dist = math.abs(tx - px) + math.abs(ty - py)
-                    if dist < minDist then
-                        minDist = dist
-                        targetX, targetY = tx, ty
-                    end
-                end
-            end
-
-            -- 2. Jika ada block, jalan ke tengah block tersebut
-            if targetX and targetY then
-                State.LastAction = ("Jalan ke block (%d,%d)"):format(targetX, targetY)
-                updateStatus()
-
-                -- Paksa lepas tombol manual agar tidak bentrok
-                AutoInput.right, AutoInput.left = false, false
-                AutoInput.active = false
-                
-                -- Gunakan sistem walkTo milik game (A*) untuk jalan ke depan block
-                -- Kita jalan ke (targetX, targetY + 1) supaya berdiri di bawah/atas block
-                local standX, standY = targetX, targetY + 1
-                local ok = Auto.walkTo(standX, standY, 15) 
-                
-                if not ok then
-                    -- Kalau gagal, jalan ke tile block itu sendiri (siapa tahu block-nya lantai)
-                    Auto.walkTo(targetX, targetY, 10)
-                end
-                
-                -- Beri jeda sedikit sebelum memukul
-                task.wait(0.2)
-                State.Cycles = State.Cycles + 1
-                continue
-            end
-        end
-        -- ======================================================
 
         if doBreak then
             local safe, reason = Drops.prepareWork(tiles, px, py, live)
@@ -3692,17 +3625,9 @@ local function farmLoop(runId)
             end
             if not waitMs((State.Override and State.Override.breakMs) or State.BreakMs, runId) then break end
         end
-
         State.Cycles = State.Cycles + 1
         if os.clock() - lastStatus > 1 then lastStatus = os.clock(); updateStatus() end
     end
-    
-    -- Lepas semua tombol saat loop berhenti
-    AutoInput.right, AutoInput.left = false, false
-    if not Clear.Running and not Farmer.Running and not Pabrik.Running and not Build.Running then
-        AutoInput.active = false
-    end
-
     updateStatus()
 end
 
@@ -3760,7 +3685,7 @@ local function startFarm()
     State.DropPause, State.WaitingDrops, State.WorkReason = false, false, nil
     State.DropError, State.DropOffUntil = nil, 0
     State.FarmError = nil
-    -- JANGAN reset Walk.Enabled di sini. Biarkan UI yang mengatur.
+
     State.Running = true
     State.RunId = (State.RunId or 0) + 1
     setRunningVisual()
@@ -10583,15 +10508,6 @@ safe(function()
         Desc = "Ambil drop di semua tile grid (caranya ikut Mode collect)",
         Value = State.AutoCollect,
         Callback = function(on) State.AutoCollect = on end,
-    })
-end)
-
-safe(function()
-    Box.FarmCtl:Toggle({
-        Title = "Auto Pindah Target",
-        Desc = "Otomatis jalan mendekati block yang tersisa di Grid",
-        Value = Walk.Enabled,
-        Callback = function(on) Walk.Enabled = on end,
     })
 end)
 
