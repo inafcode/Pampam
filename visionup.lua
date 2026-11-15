@@ -3741,11 +3741,7 @@ local function startFarm()
     State.DropPause, State.WaitingDrops, State.WorkReason = false, false, nil
     State.DropError, State.DropOffUntil = nil, 0
     State.FarmError = nil
-    -- Reset data jalan otomatis agar langsung jalan saat START ulang
-    Walk.Enabled = Config.Data["Walk"] and Config.Data["Walk"].Enabled or false
-    Walk.Dir = Config.Data["Walk"] and Config.Data["Walk"].Dir or "Kanan"
-    Walk.HoldMs = Config.Data["Walk"] and Config.Data["Walk"].HoldMs or 400
-    Walk.WaitMs = Config.Data["Walk"] and Config.Data["Walk"].WaitMs or 100
+    -- JANGAN reset Walk.Enabled di sini. Biarkan UI yang mengatur.
     State.Running = true
     State.RunId = (State.RunId or 0) + 1
     setRunningVisual()
