@@ -3535,39 +3535,51 @@ local function farmLoop(runId)
             end
         end
 
-        -- ===== LOGIKA JALAN OTOMATIS =====
+        -- ===== SENSOR PINTAR: CARI BLOCK & JALAN OTOMATIS =====
         if Walk.Enabled and not hasBreakable and not doPlace then
-            State.LastAction = "Tile kosong, jalan " .. Walk.Dir
-            updateStatus()
-            
-            -- 1. Lepas semua tombol dulu sebelum mulai (pasti bersih)
-            AutoInput.active = false
-            AutoInput.right, AutoInput.left = false, false
-            task.wait(0.1) -- Beri jeda ke game untuk mendeteksi pelepasan tombol
-            
-            -- 2. Tekan tombol arah
-            local dir = (Walk.Dir == "Kanan")
-            AutoInput.active = true
-            AutoInput.right = dir
-            AutoInput.left = not dir
-            
-            -- 3. Tahan tombol selama HoldMs
-            if not waitMs(Walk.HoldMs, runId) then break end
-            
-            -- 4. Lepas tombol dan lepas kuncian input
-            AutoInput.right, AutoInput.left = false, false
-            AutoInput.active = false
-            if AutoInput.unbindMenu then pcall(AutoInput.unbindMenu) end
-            if AutoInput.bindMenu then pcall(AutoInput.bindMenu, true) end
-            
-            -- 5. Beri jeda yang lebih lama (minimal 500ms) agar game tidak mendeteksi spam
-            local safeWait = math.max(Walk.WaitMs, 500)
-            if not waitMs(safeWait, runId) then break end
-            
-            State.Cycles = State.Cycles + 1
-            continue
+            local targetX, targetY = nil, nil
+            local minDist = 999
+
+            -- 1. Cari block terdekat di sekitar Grid
+            for _, o in ipairs(sortedOffsets()) do
+                local tx, ty = px + o.dx, py + o.dy
+                local fg = tileAt("fg", tx, ty)
+                -- Jika ada block yang bisa dipecah
+                if fg and fg ~= 0 and canBreak(fg) then
+                    local dist = math.abs(tx - px) + math.abs(ty - py)
+                    if dist < minDist then
+                        minDist = dist
+                        targetX, targetY = tx, ty
+                    end
+                end
+            end
+
+            -- 2. Jika ada block, jalan ke tengah block tersebut
+            if targetX and targetY then
+                State.LastAction = ("Jalan ke block (%d,%d)"):format(targetX, targetY)
+                updateStatus()
+
+                -- Paksa lepas tombol manual agar tidak bentrok
+                AutoInput.right, AutoInput.left = false, false
+                AutoInput.active = false
+                
+                -- Gunakan sistem walkTo milik game (A*) untuk jalan ke depan block
+                -- Kita jalan ke (targetX, targetY + 1) supaya berdiri di bawah/atas block
+                local standX, standY = targetX, targetY + 1
+                local ok = Auto.walkTo(standX, standY, 15) 
+                
+                if not ok then
+                    -- Kalau gagal, jalan ke tile block itu sendiri (siapa tahu block-nya lantai)
+                    Auto.walkTo(targetX, targetY, 10)
+                end
+                
+                -- Beri jeda sedikit sebelum memukul
+                task.wait(0.2)
+                State.Cycles = State.Cycles + 1
+                continue
+            end
         end
-        -- ===================================
+        -- ======================================================
 
         if doBreak then
             local safe, reason = Drops.prepareWork(tiles, px, py, live)
@@ -10576,8 +10588,8 @@ end)
 
 safe(function()
     Box.FarmCtl:Toggle({
-        Title = "Jalan Saat Farm",
-        Desc = "Karakter otomatis berjalan setelah memukul/memasang block",
+        Title = "Auto Pindah Target",
+        Desc = "Otomatis jalan mendekati block yang tersisa di Grid",
         Value = Walk.Enabled,
         Callback = function(on) Walk.Enabled = on end,
     })
