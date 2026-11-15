@@ -411,6 +411,13 @@ end)()
 ---------------------------------------------------------------------
 -- PENGATURAN & DATA
 ---------------------------------------------------------------------
+local Walk = {
+    Enabled = false,
+    Dir = "Kanan",
+    Count = 0,
+    Status = "-",
+}
+
 local State = {
     Running = false,
     Mode = "Place + Break",       -- "Place + Break" | "Break saja" | "Place saja"
@@ -3497,6 +3504,7 @@ local function farmLoop(runId)
         return State.Running and alive() and State.RunId == runId and Refs.World == world
             and world.fg == grid and rawget(world, "name") == worldName and not State.DropPause
     end
+    
     while State.Running and alive() and State.RunId == runId do
         if State.DropPause then pausedForDrop = true; task.wait(0.2); continue end
         if Refs.World ~= world or not world or world.fg ~= grid or rawget(world, "name") ~= worldName then
@@ -3508,12 +3516,60 @@ local function farmLoop(runId)
             else stopFarm("World berubah; mulai Auto Farm lagi di world tujuan"); return end
         end
         pausedForDrop = false
+        
         local doPlace, doBreak = farmMode() ~= "Break saja", farmMode() ~= "Place saja"
         local px, py = getPlayerTile()
         if not px then stopFarm("Karakter tidak ditemukan (keluar world?)"); return end
+        
         local tiles = {}
         for _, o in ipairs(sortedOffsets()) do tiles[#tiles + 1] = { x = px + o.dx, y = py + o.dy } end
 
+        -- Cek apakah masih ada block yang bisa di-break di pola Grid
+        local hasBreakable = false
+        for _, t in ipairs(tiles) do
+            local fg = tileAt("fg", t.x, t.y)
+            if fg and fg ~= 0 and canBreak(fg) then
+                hasBreakable = true
+                break
+            end
+        end
+
+        -- ===== LOGIKA AUTO WALK PINTAR =====
+        -- Jika semua block di Grid sudah hancur, dan auto walk menyala
+        if Walk.Enabled and not hasBreakable and not doPlace then
+            Walk.Count = Walk.Count + 1
+            State.LastAction = ("Target kosong, geser %s #%d"):format(Walk.Dir, Walk.Count)
+            updateStatus()
+
+            -- Lepas input lama
+            AutoInput.active = false
+            AutoInput.right, AutoInput.left = false, false
+            task.wait(0.15) -- beri game waktu jeda
+
+            -- Tekan arah sebentar saja untuk geser 1 langkah (misal 200ms)
+            -- Ini mencegah karakter lari terlalu jauh
+            local dir = (Walk.Dir == "Kanan")
+            AutoInput.active = true
+            AutoInput.right = dir
+            AutoInput.left = not dir
+            
+            if not waitMs(250, runId) then break end -- Tahan tombol 250ms
+            
+            -- Lepas tombol dan reset input (WASD aman)
+            AutoInput.right, AutoInput.left = false, false
+            AutoInput.active = false
+            if AutoInput.unbindMenu then pcall(AutoInput.unbindMenu) end
+            if AutoInput.bindMenu then pcall(AutoInput.bindMenu, true) end
+
+            -- Tunggu karakter berhenti bergeser
+            task.wait(0.3)
+
+            State.Cycles = State.Cycles + 1
+            continue
+        end
+        -- ===================================
+
+        -- (Sisa kode pukul block tetap sama)
         if doBreak then
             local safe, reason = Drops.prepareWork(tiles, px, py, live)
             State.WorkReason, State.WaitingDrops = reason, #safe == 0
@@ -3628,6 +3684,13 @@ local function farmLoop(runId)
         State.Cycles = State.Cycles + 1
         if os.clock() - lastStatus > 1 then lastStatus = os.clock(); updateStatus() end
     end
+    
+    -- Lepas semua tombol saat loop berhenti
+    AutoInput.right, AutoInput.left = false, false
+    if not Clear.Running and not Farmer.Running and not Pabrik.Running and not Build.Running then
+        AutoInput.active = false
+    end
+
     updateStatus()
 end
 
@@ -6848,12 +6911,6 @@ local function startFarm()
     State.DropPause, State.WaitingDrops, State.WorkReason = false, false, nil
     State.DropError, State.DropOffUntil = nil, 0
     State.FarmError = nil
-
-    -- PAKSA BACA DARI UI, JANGAN DARI CONFIG
-    -- Ini memastikan kalau kamu nyalakan toggle, nilainya selalu true
-    if UI.WalkToggle and UI.WalkToggle.Value ~= nil then
-        Walk.Enabled = UI.WalkToggle.Value
-    end
 
     State.Running = true
     State.RunId = (State.RunId or 0) + 1
@@ -10540,6 +10597,14 @@ addNumber(Box.FarmCtl, {
     Callback = function(v) State.CollectRadius = math.floor(v) end,
 })
 
+safe(function()
+    UI.WalkToggle = Box.FarmCtl:Toggle({
+        Title = "Auto Pindah Target",
+        Desc = "Otomatis geser jika block di Grid sudah hancur",
+        Value = Walk.Enabled, -- Ini membaca Walk.Enabled (false)
+        Callback = function(on) Walk.Enabled = on end, -- Ini mengubahnya saat diklik
+    })
+end)
 
 safe(function()
     Box.FarmCtl:Button({
