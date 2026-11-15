@@ -3505,6 +3505,7 @@ local function farmLoop(runId)
         return State.Running and alive() and State.RunId == runId and Refs.World == world
             and world.fg == grid and rawget(world, "name") == worldName and not State.DropPause
     end
+    
     while State.Running and alive() and State.RunId == runId do
         if State.DropPause then pausedForDrop = true; task.wait(0.2); continue end
         if Refs.World ~= world or not world or world.fg ~= grid or rawget(world, "name") ~= worldName then
@@ -3516,24 +3517,28 @@ local function farmLoop(runId)
             else stopFarm("World berubah; mulai Auto Farm lagi di world tujuan"); return end
         end
         pausedForDrop = false
+        
         local doPlace, doBreak = farmMode() ~= "Break saja", farmMode() ~= "Place saja"
         local px, py = getPlayerTile()
         if not px then stopFarm("Karakter tidak ditemukan (keluar world?)"); return end
+        
         local tiles = {}
         for _, o in ipairs(sortedOffsets()) do tiles[#tiles + 1] = { x = px + o.dx, y = py + o.dy } end
 
-        -- Cek apakah masih ada block yang bisa di-break di tile Grid
+        -- Cek apakah masih ada block yang bisa di-break (hanya cek foreground/fg)
         local hasBreakable = false
         for _, t in ipairs(tiles) do
-            if breakableAt(t.x, t.y) then
+            local fg = tileAt("fg", t.x, t.y)
+            if fg and fg ~= 0 and canBreak(fg) then
                 hasBreakable = true
                 break
             end
         end
 
-        -- Jika sudah tidak ada block (kosong) dan Auto Walk aktif, maka JALAN
+        -- ===== LOGIKA JALAN OTOMATIS =====
+        -- Jika Tile Grid sudah kosong (tidak ada block fg) DAN mode bukan Place + Break, maka JALAN
         if Walk.Enabled and not hasBreakable and not doPlace then
-            State.LastAction = "Tile Grid kosong, jalan " .. Walk.Dir
+            State.LastAction = "Tile kosong, jalan " .. Walk.Dir
             updateStatus()
             
             -- Tekan arah
@@ -3542,17 +3547,18 @@ local function farmLoop(runId)
             AutoInput.right = dir
             AutoInput.left = not dir
             
-            -- Jalan selama HoldMs
+            -- Jalan selama HoldMs (sesuai slider UI: 500ms)
             if not waitMs(Walk.HoldMs, runId) then break end
             
-            -- Berhenti dan tunggu
+            -- Lepas tombol, lalu tunggu selama WaitMs (sesuai slider UI: 100ms)
             AutoInput.right, AutoInput.left = false, false
             if not waitMs(Walk.WaitMs, runId) then break end
             
-            -- Lanjut ke loop berikutnya (pukul lagi di posisi baru)
+            -- Ulangi loop (script akan pukul block baru di posisi yang sudah jalan)
             State.Cycles = State.Cycles + 1
             continue
         end
+        -- ===================================
 
         if doBreak then
             local safe, reason = Drops.prepareWork(tiles, px, py, live)
