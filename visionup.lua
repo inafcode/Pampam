@@ -6887,48 +6887,45 @@ stopFarmer = function(reason)
     updateFarmerStatus()
 end
 
-local function startFarmer()
-    if Farmer.Running then return end
-    local err = checkAutoStart()
-    if not err and not Farmer.Harvest and not Farmer.Plant then
-        err = "Aktifkan Auto Harvest atau Auto Plant"
-    end
-    if not err and not Farmer.Harvest and not Farmer.SeedId then
-        err = "Pilih seed dulu untuk Auto Plant"
-    end
+local function startFarm()
+    if State.Running then return end
+    local err = validate()
     if err then
-        notify("Farmer", err, 4)
-        setFarmerVisual()
+        stopFarm(err)
         return
     end
-    if Farmer.Harvest and not Refs.Trees and not findTreeRefs() then
-        notify("Farmer", "Data pohon tidak ketemu: Auto Harvest tidak bisa cek pohon siap", 5)
+    if Splice.Running and Splice.stop then Splice.stop("Dihentikan karena Auto Farm dimulai") end
+    if Pabrik.Running and Pabrik.stop then Pabrik.stop("Dihentikan karena Auto Farm dimulai") end
+    if Build.Running and Build.stop then Build.stop("Dihentikan karena Auto Farm dimulai") end
+    if Clear.Running and stopClear then stopClear("Dihentikan karena Auto Farm dimulai") end
+    if Farmer.Running and stopFarmer then stopFarmer("Dihentikan karena Auto Farm dimulai") end
+    table.clear(HitCount)
+    table.clear(PlacedAt)
+    State.DropPause, State.WaitingDrops, State.WorkReason = false, false, nil
+    State.DropError, State.DropOffUntil = nil, 0
+    State.FarmError = nil
+
+    -- PAKSA BACA DARI UI, JANGAN DARI CONFIG
+    -- Ini memastikan kalau kamu nyalakan toggle, nilainya selalu true
+    if UI.WalkToggle and UI.WalkToggle.Value ~= nil then
+        Walk.Enabled = UI.WalkToggle.Value
     end
-    if Splice.Running and Splice.stop then Splice.stop("Dihentikan karena Farmer dimulai") end
-    if Pabrik.Running and Pabrik.stop then Pabrik.stop("Dihentikan karena Farmer dimulai") end
-    if Build.Running and Build.stop then Build.stop("Dihentikan karena Farmer dimulai") end
-    if State.Running then stopFarm("Dihentikan karena Farmer dimulai") end
-    if Clear.Running then stopClear("Dihentikan karena Farmer dimulai") end
-    table.clear(Farmer.Skip)
-    table.clear(FarmerFail)
-    table.clear(BadEdge)
-    table.clear(Farmer.Row)
-    Farmer.DropOffUntil = 0
-    Farmer.SweepDir = nil
-    Farmer.PlantRoute = nil
-    Farmer.BatchHarvest, Farmer.BatchPlanted = 0, 0
-    Farmer.RefillNext, Farmer.RefillSkip, Farmer.RefillWorld, Farmer.RefillFor = 0, {}, nil, nil
-    Farmer.RefillStatus = "Otomatis ambil seed pilihan saat habis"
-    Farmer.Status = "Mulai..."
-    Farmer.Running = true
-    autoBegin()
-    setFarmerVisual()
-    updateFarmerStatus()
+
+    State.Running = true
+    State.RunId = (State.RunId or 0) + 1
+    setRunningVisual()
+    updateStatus()
+    local runId = State.RunId
     task.spawn(function()
-        local ok, e = pcall(farmerLoop)
-        if not ok then
-            warn("[Zekio supreme TEST] Farmer error: " .. tostring(e))
-            if Farmer.Running then stopFarmer("Error: " .. tostring(e)) end
+        local ok, err = xpcall(function() farmLoop(runId) end, function(message)
+            if debug and type(debug.traceback) == "function" then
+                return debug.traceback(tostring(message), 2)
+            end
+            return tostring(message)
+        end)
+        if not ok and alive() and State.RunId == runId then
+            warn("[Zekio TEST Farm] " .. tostring(err))
+            stopFarm("Farm error: " .. tostring(err))
         end
     end)
 end
