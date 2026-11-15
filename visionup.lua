@@ -3700,20 +3700,18 @@ stopFarm = function(reason)
     State.RunId = (State.RunId or 0) + 1
     State.FarmError = reason
     
-    -- TAMBAHAN: Lepas semua tombol
+    -- Lepas semua tombol
     AutoInput.right, AutoInput.left = false, false
     AutoInput.active = false
     
-    -- TAMBAHAN BARU: Lepas paksa kuncian input game, lalu pasang ulang
-    if AutoInput.unbindMenu then
-        pcall(AutoInput.unbindMenu)
-    end
-    if AutoInput.bindMenu then
-        pcall(AutoInput.bindMenu, true)
-    end
-    -- ========================================
+    -- Lepas paksa kuncian input game
+    if AutoInput.unbindMenu then pcall(AutoInput.unbindMenu) end
+    if AutoInput.bindMenu then pcall(AutoInput.bindMenu, true) end
 
     setRunningVisual()
+    
+    -- JANGAN ubah Walk.Enabled di sini!
+    
     if reason and not State.Quiet then
         notify("Auto Farm berhenti", reason, 4)
         Hook.send("stop", "Auto Farm berhenti: " .. reason)
