@@ -3522,6 +3522,38 @@ local function farmLoop(runId)
         local tiles = {}
         for _, o in ipairs(sortedOffsets()) do tiles[#tiles + 1] = { x = px + o.dx, y = py + o.dy } end
 
+        -- Cek apakah masih ada block yang bisa di-break di tile Grid
+        local hasBreakable = false
+        for _, t in ipairs(tiles) do
+            if breakableAt(t.x, t.y) then
+                hasBreakable = true
+                break
+            end
+        end
+
+        -- Jika sudah tidak ada block (kosong) dan Auto Walk aktif, maka JALAN
+        if Walk.Enabled and not hasBreakable and not doPlace then
+            State.LastAction = "Tile Grid kosong, jalan " .. Walk.Dir
+            updateStatus()
+            
+            -- Tekan arah
+            local dir = (Walk.Dir == "Kanan")
+            AutoInput.active = true
+            AutoInput.right = dir
+            AutoInput.left = not dir
+            
+            -- Jalan selama HoldMs
+            if not waitMs(Walk.HoldMs, runId) then break end
+            
+            -- Berhenti dan tunggu
+            AutoInput.right, AutoInput.left = false, false
+            if not waitMs(Walk.WaitMs, runId) then break end
+            
+            -- Lanjut ke loop berikutnya (pukul lagi di posisi baru)
+            State.Cycles = State.Cycles + 1
+            continue
+        end
+
         if doBreak then
             local safe, reason = Drops.prepareWork(tiles, px, py, live)
             State.WorkReason, State.WaitingDrops = reason, #safe == 0
@@ -3634,43 +3666,15 @@ local function farmLoop(runId)
             if not waitMs((State.Override and State.Override.breakMs) or State.BreakMs, runId) then break end
         end
 
-        -- ===== TAMBAHAN: LOGIKA JALAN SETELAH BREAK/PLACE =====
-        if Walk.Enabled and live() and not State.WaitingDrops then
-            -- Berhenti sejenak sebelum jalan
-            task.wait(0.1)
-            
-            -- Tekan tombol arah selama HoldMs
-            local dir = (Walk.Dir == "Kanan")
-            AutoInput.active = true
-            AutoInput.right = dir
-            AutoInput.left = not dir
-            State.LastAction = "Jalan " .. Walk.Dir
-            updateStatus()
-            
-            if not waitMs(Walk.HoldMs, runId) then break end
-            
-            -- Lepas tombol, tunggu selama WaitMs
-            AutoInput.right, AutoInput.left = false, false
-            State.LastAction = "Tunggu " .. Walk.WaitMs .. "ms"
-            updateStatus()
-            
-            if not waitMs(Walk.WaitMs, runId) then break end
-            
-            -- Pastikan tombol lepas setelah selesai
-            AutoInput.right, AutoInput.left = false, false
-        end
-        -- =======================================================
-
         State.Cycles = State.Cycles + 1
         if os.clock() - lastStatus > 1 then lastStatus = os.clock(); updateStatus() end
     end
     
-    -- TAMBAHAN: Pastikan tombol lepas saat loop selesai (walau stop dari luar)
+    -- Lepas semua tombol saat loop berhenti
     AutoInput.right, AutoInput.left = false, false
     if not Clear.Running and not Farmer.Running and not Pabrik.Running and not Build.Running then
         AutoInput.active = false
     end
-    -- ========================================
 
     updateStatus()
 end
@@ -3731,6 +3735,11 @@ local function startFarm()
     State.DropPause, State.WaitingDrops, State.WorkReason = false, false, nil
     State.DropError, State.DropOffUntil = nil, 0
     State.FarmError = nil
+    -- Reset data jalan otomatis agar langsung jalan saat START ulang
+    Walk.Enabled = Config.Data["Walk"] and Config.Data["Walk"].Enabled or false
+    Walk.Dir = Config.Data["Walk"] and Config.Data["Walk"].Dir or "Kanan"
+    Walk.HoldMs = Config.Data["Walk"] and Config.Data["Walk"].HoldMs or 400
+    Walk.WaitMs = Config.Data["Walk"] and Config.Data["Walk"].WaitMs or 100
     State.Running = true
     State.RunId = (State.RunId or 0) + 1
     setRunningVisual()

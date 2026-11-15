@@ -411,6 +411,14 @@ end)()
 ---------------------------------------------------------------------
 -- PENGATURAN & DATA
 ---------------------------------------------------------------------
+-- ===== DATA FITUR: JALAN SAAT FARM =====
+local Walk = {
+    Enabled = false,      -- nyala/mati saat farm
+    Dir = "Kanan",        -- "Kanan" atau "Kiri"
+    HoldMs = 400,         -- durasi tekan (ms)
+    WaitMs = 200,         -- durasi tunggu (ms)
+}
+
 local State = {
     Running = false,
     Mode = "Place + Break",       -- "Place + Break" | "Break saja" | "Place saja"
@@ -3537,8 +3545,6 @@ local function farmLoop(runId)
                 if pendingBg[key] and (tileAt("fg", t.x, t.y) ~= 0 or not canBreak(tileAt("bg", t.x, t.y))) then
                     pendingBg[key] = nil
                 end
-                -- Finish a background layer after collecting the foreground
-                -- rewards, before placing the next foreground block on it.
                 if not pendingBg[key] and (not doBreak or Drops.tileReady(t)) then
                     local r, why = tryPlace(t.x, t.y)
                     if not live() then break end
@@ -3586,7 +3592,7 @@ local function farmLoop(runId)
                             acted = acted or r ~= nil
                         end
                         if r == "broke" then
-                            broke, a.done = true, true -- collect before another layer or place cycle
+                            broke, a.done = true, true
                             local key = a.x .. "," .. a.y
                             pendingBg[key] = State.BreakBackground and tileAt("fg", a.x, a.y) == 0
                                 and canBreak(tileAt("bg", a.x, a.y)) or nil
@@ -3627,9 +3633,45 @@ local function farmLoop(runId)
             end
             if not waitMs((State.Override and State.Override.breakMs) or State.BreakMs, runId) then break end
         end
+
+        -- ===== TAMBAHAN: LOGIKA JALAN SETELAH BREAK/PLACE =====
+        if Walk.Enabled and live() and not State.WaitingDrops then
+            -- Berhenti sejenak sebelum jalan
+            task.wait(0.1)
+            
+            -- Tekan tombol arah selama HoldMs
+            local dir = (Walk.Dir == "Kanan")
+            AutoInput.active = true
+            AutoInput.right = dir
+            AutoInput.left = not dir
+            State.LastAction = "Jalan " .. Walk.Dir
+            updateStatus()
+            
+            if not waitMs(Walk.HoldMs, runId) then break end
+            
+            -- Lepas tombol, tunggu selama WaitMs
+            AutoInput.right, AutoInput.left = false, false
+            State.LastAction = "Tunggu " .. Walk.WaitMs .. "ms"
+            updateStatus()
+            
+            if not waitMs(Walk.WaitMs, runId) then break end
+            
+            -- Pastikan tombol lepas setelah selesai
+            AutoInput.right, AutoInput.left = false, false
+        end
+        -- =======================================================
+
         State.Cycles = State.Cycles + 1
         if os.clock() - lastStatus > 1 then lastStatus = os.clock(); updateStatus() end
     end
+    
+    -- TAMBAHAN: Pastikan tombol lepas saat loop selesai (walau stop dari luar)
+    AutoInput.right, AutoInput.left = false, false
+    if not Clear.Running and not Farmer.Running and not Pabrik.Running and not Build.Running then
+        AutoInput.active = false
+    end
+    -- ========================================
+
     updateStatus()
 end
 
@@ -3647,6 +3689,20 @@ stopFarm = function(reason)
     State.Running = false
     State.RunId = (State.RunId or 0) + 1
     State.FarmError = reason
+    
+    -- TAMBAHAN: Lepas semua tombol
+    AutoInput.right, AutoInput.left = false, false
+    AutoInput.active = false
+    
+    -- TAMBAHAN BARU: Lepas paksa kuncian input game, lalu pasang ulang
+    if AutoInput.unbindMenu then
+        pcall(AutoInput.unbindMenu)
+    end
+    if AutoInput.bindMenu then
+        pcall(AutoInput.bindMenu, true)
+    end
+    -- ========================================
+
     setRunningVisual()
     if reason and not State.Quiet then
         notify("Auto Farm berhenti", reason, 4)
@@ -10502,6 +10558,41 @@ safe(function()
         Callback = function(on) State.AutoCollect = on end,
     })
 end)
+
+safe(function()
+    Box.FarmCtl:Toggle({
+        Title = "Jalan Saat Farm",
+        Desc = "Karakter otomatis berjalan setelah memukul/memasang block",
+        Value = Walk.Enabled,
+        Callback = function(on) Walk.Enabled = on end,
+    })
+end)
+
+safe(function()
+    Box.FarmCtl:Dropdown({
+        Title = "Arah Jalan",
+        Values = { "Kanan", "Kiri" },
+        Value = Walk.Dir,
+        Callback = function(opt)
+            if type(opt) == "table" then opt = opt[1] end
+            if opt == "Kanan" or opt == "Kiri" then Walk.Dir = opt end
+        end,
+    })
+end)
+
+addNumber(Box.FarmCtl, {
+    Title = "Durasi Tekan Jalan (ms)",
+    Desc = "Berapa lama tombol arah ditekan (berjalan)",
+    Min = 100, Max = 3000, Step = 50, Default = Walk.HoldMs,
+    Callback = function(v) Walk.HoldMs = math.floor(v) end,
+})
+
+addNumber(Box.FarmCtl, {
+    Title = "Durasi Tunggu Jalan (ms)",
+    Desc = "Berapa lama karakter berhenti sebelum jalan lagi",
+    Min = 50, Max = 3000, Step = 50, Default = Walk.WaitMs,
+    Callback = function(v) Walk.WaitMs = math.floor(v) end,
+})
 
 safe(function()
     Box.FarmCtl:Dropdown({
