@@ -3536,25 +3536,34 @@ local function farmLoop(runId)
         end
 
         -- ===== LOGIKA JALAN OTOMATIS =====
-        -- Jika Tile Grid sudah kosong (tidak ada block fg) DAN mode bukan Place + Break, maka JALAN
         if Walk.Enabled and not hasBreakable and not doPlace then
             State.LastAction = "Tile kosong, jalan " .. Walk.Dir
             updateStatus()
             
-            -- Tekan arah
+            -- 1. Lepas semua tombol dulu sebelum mulai (pasti bersih)
+            AutoInput.active = false
+            AutoInput.right, AutoInput.left = false, false
+            task.wait(0.1) -- Beri jeda ke game untuk mendeteksi pelepasan tombol
+            
+            -- 2. Tekan tombol arah
             local dir = (Walk.Dir == "Kanan")
             AutoInput.active = true
             AutoInput.right = dir
             AutoInput.left = not dir
             
-            -- Jalan selama HoldMs (sesuai slider UI: 500ms)
+            -- 3. Tahan tombol selama HoldMs
             if not waitMs(Walk.HoldMs, runId) then break end
             
-            -- Lepas tombol, lalu tunggu selama WaitMs (sesuai slider UI: 100ms)
+            -- 4. Lepas tombol dan lepas kuncian input
             AutoInput.right, AutoInput.left = false, false
-            if not waitMs(Walk.WaitMs, runId) then break end
+            AutoInput.active = false
+            if AutoInput.unbindMenu then pcall(AutoInput.unbindMenu) end
+            if AutoInput.bindMenu then pcall(AutoInput.bindMenu, true) end
             
-            -- Ulangi loop (script akan pukul block baru di posisi yang sudah jalan)
+            -- 5. Beri jeda yang lebih lama (minimal 500ms) agar game tidak mendeteksi spam
+            local safeWait = math.max(Walk.WaitMs, 500)
+            if not waitMs(safeWait, runId) then break end
+            
             State.Cycles = State.Cycles + 1
             continue
         end
