@@ -3664,6 +3664,14 @@ local function farmLoop(runId)
         State.Cycles = State.Cycles + 1
         if os.clock() - lastStatus > 1 then lastStatus = os.clock(); updateStatus() end
     end
+    
+    -- TAMBAHAN: Pastikan tombol lepas saat loop selesai (walau stop dari luar)
+    AutoInput.right, AutoInput.left = false, false
+    if not Clear.Running and not Farmer.Running and not Pabrik.Running and not Build.Running then
+        AutoInput.active = false
+    end
+    -- ========================================
+
     updateStatus()
 end
 
@@ -3681,6 +3689,12 @@ stopFarm = function(reason)
     State.Running = false
     State.RunId = (State.RunId or 0) + 1
     State.FarmError = reason
+    
+    -- TAMBAHAN: Lepas semua tombol saat stop
+    AutoInput.right, AutoInput.left = false, false
+    AutoInput.active = false
+    -- ========================================
+
     setRunningVisual()
     if reason and not State.Quiet then
         notify("Auto Farm berhenti", reason, 4)
