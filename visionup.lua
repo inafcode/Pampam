@@ -10513,32 +10513,6 @@ end)
 
 safe(function()
     Box.FarmCtl:Dropdown({
-        Title = "Arah Jalan",
-        Values = { "Kanan", "Kiri" },
-        Value = Walk.Dir,
-        Callback = function(opt)
-            if type(opt) == "table" then opt = opt[1] end
-            if opt == "Kanan" or opt == "Kiri" then Walk.Dir = opt end
-        end,
-    })
-end)
-
-addNumber(Box.FarmCtl, {
-    Title = "Durasi Tekan Jalan (ms)",
-    Desc = "Berapa lama tombol arah ditekan (berjalan)",
-    Min = 100, Max = 3000, Step = 50, Default = Walk.HoldMs,
-    Callback = function(v) Walk.HoldMs = math.floor(v) end,
-})
-
-addNumber(Box.FarmCtl, {
-    Title = "Durasi Tunggu Jalan (ms)",
-    Desc = "Berapa lama karakter berhenti sebelum jalan lagi",
-    Min = 50, Max = 3000, Step = 50, Default = Walk.WaitMs,
-    Callback = function(v) Walk.WaitMs = math.floor(v) end,
-})
-
-safe(function()
-    Box.FarmCtl:Dropdown({
         Title = "Mode collect",
         Desc = "Berlaku untuk semua fitur. Sentuhan = seperti main manual. Remote = ambil dari jauh (cara lama, cepat)",
         Values = { "Sentuhan", "Remote" },
