@@ -3690,9 +3690,17 @@ stopFarm = function(reason)
     State.RunId = (State.RunId or 0) + 1
     State.FarmError = reason
     
-    -- TAMBAHAN: Lepas semua tombol saat stop
+    -- TAMBAHAN: Lepas semua tombol
     AutoInput.right, AutoInput.left = false, false
     AutoInput.active = false
+    
+    -- TAMBAHAN BARU: Lepas paksa kuncian input game, lalu pasang ulang
+    if AutoInput.unbindMenu then
+        pcall(AutoInput.unbindMenu)
+    end
+    if AutoInput.bindMenu then
+        pcall(AutoInput.bindMenu, true)
+    end
     -- ========================================
 
     setRunningVisual()
