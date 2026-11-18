@@ -13924,7 +13924,9 @@ local function reconnect(show)
     Drops.LastError = nil
     Auto.findTreeRefs()
     table.clear(DropFailUntil)
-    Anim.fn, Anim.idx = nil, nil
+    -- Anim.fn, Anim.idx = nil, nil
+    -- pcall(Anim.findFast)
+    Anim.fn, Anim.idx, Anim.ctx = nil, nil, nil
     pcall(Anim.findFast)
     if State.LiteMode then setLite(true) end
     if Misc.InfJump then hookJammer() end
