@@ -411,13 +411,6 @@ end)()
 ---------------------------------------------------------------------
 -- PENGATURAN & DATA
 ---------------------------------------------------------------------
--- ===== DATA FITUR: JALAN SAAT FARM =====
-local Walk = {
-    Enabled = false,      -- nyala/mati saat farm
-    Dir = "Kanan",        -- "Kanan" atau "Kiri"
-    HoldMs = 400,         -- durasi tekan (ms)
-    WaitMs = 200,         -- durasi tunggu (ms)
-}
 
 local State = {
     Running = false,
@@ -3496,6 +3489,45 @@ local function raymanAct(dir)
     end
 end
 
+-- ===== AUTO PINDAH TARGET =====
+-- Dipanggil dari farmLoop (thread yang sama), jadi tidak rebutan kontrol gerak
+-- dengan Auto Farm dan otomatis berhenti saat Auto Farm di-stop.
+local Walk = {
+    Enabled = false,
+    Dir = "Kanan",
+    HoldMs = 400,   -- lama tombol arah ditekan
+    WaitMs = 500,   -- jeda setelah melangkah (menunggu karakter berhenti / mendarat)
+    Count = 0,      -- jumlah langkah
+    Stuck = 0,      -- berapa kali berturut-turut tidak bergeser
+}
+
+function Walk.step(live)
+    if not OrigIsDown then
+        State.LastAction = "Auto Pindah Target: kontrol gerak belum terhubung (tekan 'Hubungkan ke game')"
+        return false
+    end
+    local right = (Walk.Dir ~= "Kiri")
+    local was = AutoInput.active
+    local reads0 = AutoInput.Reads or 0
+    AutoInput.active = true
+    AutoInput.jump, AutoInput.down = false, false
+    AutoInput.left, AutoInput.right = not right, right
+    Walk.Count = Walk.Count + 1
+    State.LastAction = "Auto Pindah Target: geser " .. (right and "kanan" or "kiri")
+    local untilAt = os.clock() + math.max(Walk.HoldMs, 50) / 1000
+    while os.clock() < untilAt and live() do task.wait() end
+    AutoInput.left, AutoInput.right = false, false
+    AutoInput.active = was
+    if not live() then return true end
+    if (AutoInput.Reads or 0) == reads0 then
+        State.LastAction = "Auto Pindah Target: game tidak membaca tombol (tekan 'Hubungkan ke game')"
+        return false
+    end
+    local settleAt = os.clock() + math.max(Walk.WaitMs, 0) / 1000
+    while os.clock() < settleAt and live() do task.wait() end
+    return true
+end
+
 local function farmLoop(runId)
     local lastStatus, pendingBg = 0, {}
     local world = Refs.World
@@ -3631,47 +3663,29 @@ local function farmLoop(runId)
             if outOfBlock or (doPlace and sel and invCount(sel) <= 0) then
                 stopFarm("Block " .. itemName(sel) .. " di inventori habis"); return
             end
-            if not waitMs((State.Override and State.Override.breakMs) or State.BreakMs, runId) then break end
+                if Walk.Enabled and not State.Override and farmMode() == "Break saja" then
+                -- semua tile Grid sudah bersih: geser ke target berikutnya
+                local x0 = getPlayerTile()
+                local moved = Walk.step(live)
+                if not live() then continue end
+                local x1 = getPlayerTile()
+                if moved and x0 and x1 and x0 ~= x1 then
+                    Walk.Stuck = 0
+                else
+                    Walk.Stuck = Walk.Stuck + 1
+                end
+                if Walk.Stuck >= 3 then
+                    Walk.Stuck = 0
+                    stopFarm("Auto Pindah Target: karakter tidak bisa bergeser (ujung jalan / terhalang / tombol tidak terbaca)")
+                    return
+                end
+            elseif not waitMs((State.Override and State.Override.breakMs) or State.BreakMs, runId) then
+                break
+            end
         end
-
-        -- ===== TAMBAHAN: LOGIKA JALAN SETELAH BREAK/PLACE =====
-        if Walk.Enabled and live() and not State.WaitingDrops then
-            -- Berhenti sejenak sebelum jalan
-            task.wait(0.1)
-            
-            -- Tekan tombol arah selama HoldMs
-            local dir = (Walk.Dir == "Kanan")
-            AutoInput.active = true
-            AutoInput.right = dir
-            AutoInput.left = not dir
-            State.LastAction = "Jalan " .. Walk.Dir
-            updateStatus()
-            
-            if not waitMs(Walk.HoldMs, runId) then break end
-            
-            -- Lepas tombol, tunggu selama WaitMs
-            AutoInput.right, AutoInput.left = false, false
-            State.LastAction = "Tunggu " .. Walk.WaitMs .. "ms"
-            updateStatus()
-            
-            if not waitMs(Walk.WaitMs, runId) then break end
-            
-            -- Pastikan tombol lepas setelah selesai
-            AutoInput.right, AutoInput.left = false, false
-        end
-        -- =======================================================
-
         State.Cycles = State.Cycles + 1
         if os.clock() - lastStatus > 1 then lastStatus = os.clock(); updateStatus() end
     end
-    
-    -- TAMBAHAN: Pastikan tombol lepas saat loop selesai (walau stop dari luar)
-    AutoInput.right, AutoInput.left = false, false
-    if not Clear.Running and not Farmer.Running and not Pabrik.Running and not Build.Running then
-        AutoInput.active = false
-    end
-    -- ========================================
-
     updateStatus()
 end
 
@@ -3689,19 +3703,12 @@ stopFarm = function(reason)
     State.Running = false
     State.RunId = (State.RunId or 0) + 1
     State.FarmError = reason
-    
-    -- TAMBAHAN: Lepas semua tombol
-    AutoInput.right, AutoInput.left = false, false
+
+    -- Paksa lepas semua input
     AutoInput.active = false
-    
-    -- TAMBAHAN BARU: Lepas paksa kuncian input game, lalu pasang ulang
-    if AutoInput.unbindMenu then
-        pcall(AutoInput.unbindMenu)
-    end
-    if AutoInput.bindMenu then
-        pcall(AutoInput.bindMenu, true)
-    end
-    -- ========================================
+    AutoInput.right, AutoInput.left = false, false
+    AutoInput.jump = false
+    AutoInput.down = false
 
     setRunningVisual()
     if reason and not State.Quiet then
@@ -3721,21 +3728,35 @@ local function startFarm()
         stopFarm(err)
         return
     end
+
+    -- Matikan fitur lain
     if Splice.Running and Splice.stop then Splice.stop("Dihentikan karena Auto Farm dimulai") end
     if Pabrik.Running and Pabrik.stop then Pabrik.stop("Dihentikan karena Auto Farm dimulai") end
     if Build.Running and Build.stop then Build.stop("Dihentikan karena Auto Farm dimulai") end
     if Clear.Running and stopClear then stopClear("Dihentikan karena Auto Farm dimulai") end
     if Farmer.Running and stopFarmer then stopFarmer("Dihentikan karena Auto Farm dimulai") end
+
+    -- Bersihkan data
     table.clear(HitCount)
     table.clear(PlacedAt)
     State.DropPause, State.WaitingDrops, State.WorkReason = false, false, nil
     State.DropError, State.DropOffUntil = nil, 0
     State.FarmError = nil
+
+    -- Lepas semua tombol buatan (kontrol gerak game tidak dilepas / dipasang ulang)
+    AutoInput.active = false
+    AutoInput.left, AutoInput.right, AutoInput.jump, AutoInput.down = false, false, false, false
+    if Walk.Enabled and not OrigIsDown then pcall(AutoInput.bindMenu, true) end
+
+    -- KUNCI PERBAIKAN: Tunggu 0.5 detik agar thread lama benar-benar mati
+    task.wait(0.5)
+
     State.Running = true
     State.RunId = (State.RunId or 0) + 1
     setRunningVisual()
     updateStatus()
     local runId = State.RunId
+    
     task.spawn(function()
         local ok, err = xpcall(function() farmLoop(runId) end, function(message)
             if debug and type(debug.traceback) == "function" then
@@ -6876,48 +6897,39 @@ stopFarmer = function(reason)
     updateFarmerStatus()
 end
 
-local function startFarmer()
-    if Farmer.Running then return end
-    local err = checkAutoStart()
-    if not err and not Farmer.Harvest and not Farmer.Plant then
-        err = "Aktifkan Auto Harvest atau Auto Plant"
-    end
-    if not err and not Farmer.Harvest and not Farmer.SeedId then
-        err = "Pilih seed dulu untuk Auto Plant"
-    end
+local function startFarm()
+    if State.Running then return end
+    local err = validate()
     if err then
-        notify("Farmer", err, 4)
-        setFarmerVisual()
+        stopFarm(err)
         return
     end
-    if Farmer.Harvest and not Refs.Trees and not findTreeRefs() then
-        notify("Farmer", "Data pohon tidak ketemu: Auto Harvest tidak bisa cek pohon siap", 5)
-    end
-    if Splice.Running and Splice.stop then Splice.stop("Dihentikan karena Farmer dimulai") end
-    if Pabrik.Running and Pabrik.stop then Pabrik.stop("Dihentikan karena Farmer dimulai") end
-    if Build.Running and Build.stop then Build.stop("Dihentikan karena Farmer dimulai") end
-    if State.Running then stopFarm("Dihentikan karena Farmer dimulai") end
-    if Clear.Running then stopClear("Dihentikan karena Farmer dimulai") end
-    table.clear(Farmer.Skip)
-    table.clear(FarmerFail)
-    table.clear(BadEdge)
-    table.clear(Farmer.Row)
-    Farmer.DropOffUntil = 0
-    Farmer.SweepDir = nil
-    Farmer.PlantRoute = nil
-    Farmer.BatchHarvest, Farmer.BatchPlanted = 0, 0
-    Farmer.RefillNext, Farmer.RefillSkip, Farmer.RefillWorld, Farmer.RefillFor = 0, {}, nil, nil
-    Farmer.RefillStatus = "Otomatis ambil seed pilihan saat habis"
-    Farmer.Status = "Mulai..."
-    Farmer.Running = true
-    autoBegin()
-    setFarmerVisual()
-    updateFarmerStatus()
+    if Splice.Running and Splice.stop then Splice.stop("Dihentikan karena Auto Farm dimulai") end
+    if Pabrik.Running and Pabrik.stop then Pabrik.stop("Dihentikan karena Auto Farm dimulai") end
+    if Build.Running and Build.stop then Build.stop("Dihentikan karena Auto Farm dimulai") end
+    if Clear.Running and stopClear then stopClear("Dihentikan karena Auto Farm dimulai") end
+    if Farmer.Running and stopFarmer then stopFarmer("Dihentikan karena Auto Farm dimulai") end
+    table.clear(HitCount)
+    table.clear(PlacedAt)
+    State.DropPause, State.WaitingDrops, State.WorkReason = false, false, nil
+    State.DropError, State.DropOffUntil = nil, 0
+    State.FarmError = nil
+
+    State.Running = true
+    State.RunId = (State.RunId or 0) + 1
+    setRunningVisual()
+    updateStatus()
+    local runId = State.RunId
     task.spawn(function()
-        local ok, e = pcall(farmerLoop)
-        if not ok then
-            warn("[Zekio supreme TEST] Farmer error: " .. tostring(e))
-            if Farmer.Running then stopFarmer("Error: " .. tostring(e)) end
+        local ok, err = xpcall(function() farmLoop(runId) end, function(message)
+            if debug and type(debug.traceback) == "function" then
+                return debug.traceback(tostring(message), 2)
+            end
+            return tostring(message)
+        end)
+        if not ok and alive() and State.RunId == runId then
+            warn("[Zekio TEST Farm] " .. tostring(err))
+            stopFarm("Farm error: " .. tostring(err))
         end
     end)
 end
@@ -9896,7 +9908,58 @@ Auto.here = function()
     return nil
 end
 Auto.startClear = startClear
-Auto.startFarmer = startFarmer
+function Auto.startFarmer()
+    if Farmer.Running then return end
+    local err = checkAutoStart()
+    if err then
+        notify("Farmer", err, 4)
+        setFarmerVisual()
+        return
+    end
+    local planting = Farmer.Plant and not Farmer.HarvestOnly
+    if not Farmer.Harvest and not planting then
+        notify("Farmer", "Aktifkan Auto Harvest atau Auto Plant", 4)
+        setFarmerVisual()
+        return
+    end
+    if planting and not Farmer.SeedId then
+        notify("Farmer", "Pilih seed dulu untuk Auto Plant", 4)
+        setFarmerVisual()
+        return
+    end
+    if Farmer.Harvest and not Refs.Trees then findTreeRefs() end
+    if Farmer.Harvest and not Refs.Trees then
+        if not planting then
+            notify("Farmer", "Auto Harvest tidak bisa cek pohon siap (data pohon belum terbaca). Tekan 'Hubungkan ke game' di tab Koneksi", 6)
+            setFarmerVisual()
+            return
+        end
+        notify("Farmer", "Auto Harvest tidak bisa cek pohon siap: hanya menanam", 5)
+    end
+    if Splice.Running and Splice.stop then Splice.stop("Dihentikan karena Farmer dimulai") end
+    if Pabrik.Running and Pabrik.stop then Pabrik.stop("Dihentikan karena Farmer dimulai") end
+    if Build.Running and Build.stop then Build.stop("Dihentikan karena Farmer dimulai") end
+    if Vend.Running and Vend.stop then Vend.stop("Dihentikan karena Farmer dimulai") end
+    if State.Running then stopFarm("Dihentikan karena Farmer dimulai") end
+    if Clear.Running then stopClear("Dihentikan karena Farmer dimulai") end
+    table.clear(Farmer.Skip)
+    table.clear(FarmerFail)
+    table.clear(BadEdge)
+    Farmer.PlantRoute = nil
+    Farmer.Status = "Mulai..."
+    Farmer.Running = true
+    FC = farmerCfg()
+    autoBegin()
+    setFarmerVisual()
+    updateFarmerStatus()
+    task.spawn(function()
+        local ok, e = pcall(farmerLoop)
+        if not ok then
+            warn("[Zekio supreme TEST] Farmer error: " .. tostring(e))
+            if Farmer.Running then stopFarmer("Error: " .. tostring(e)) end
+        end
+    end)
+end
 Auto.updateClearStatus = updateClearStatus
 Auto.updateFarmerStatus = updateFarmerStatus
 Auto.findTreeRefs = findTreeRefs
@@ -10560,41 +10623,6 @@ safe(function()
 end)
 
 safe(function()
-    Box.FarmCtl:Toggle({
-        Title = "Jalan Saat Farm",
-        Desc = "Karakter otomatis berjalan setelah memukul/memasang block",
-        Value = Walk.Enabled,
-        Callback = function(on) Walk.Enabled = on end,
-    })
-end)
-
-safe(function()
-    Box.FarmCtl:Dropdown({
-        Title = "Arah Jalan",
-        Values = { "Kanan", "Kiri" },
-        Value = Walk.Dir,
-        Callback = function(opt)
-            if type(opt) == "table" then opt = opt[1] end
-            if opt == "Kanan" or opt == "Kiri" then Walk.Dir = opt end
-        end,
-    })
-end)
-
-addNumber(Box.FarmCtl, {
-    Title = "Durasi Tekan Jalan (ms)",
-    Desc = "Berapa lama tombol arah ditekan (berjalan)",
-    Min = 100, Max = 3000, Step = 50, Default = Walk.HoldMs,
-    Callback = function(v) Walk.HoldMs = math.floor(v) end,
-})
-
-addNumber(Box.FarmCtl, {
-    Title = "Durasi Tunggu Jalan (ms)",
-    Desc = "Berapa lama karakter berhenti sebelum jalan lagi",
-    Min = 50, Max = 3000, Step = 50, Default = Walk.WaitMs,
-    Callback = function(v) Walk.WaitMs = math.floor(v) end,
-})
-
-safe(function()
     Box.FarmCtl:Dropdown({
         Title = "Mode collect",
         Desc = "Berlaku untuk semua fitur. Sentuhan = seperti main manual. Remote = ambil dari jauh (cara lama, cepat)",
@@ -10623,7 +10651,6 @@ addNumber(Box.FarmCtl, {
     Callback = function(v) State.CollectRadius = math.floor(v) end,
 })
 
-
 safe(function()
     Box.FarmCtl:Button({
         Title = "Buka Grid Tile",
@@ -10631,6 +10658,47 @@ safe(function()
         Callback = function() GridGui.Enabled = true end,
     })
 end)
+
+safe(function()
+    Box.FarmCtl:Toggle({
+        Title = "Auto Pindah Target",
+        Desc = "Mode Break saja: geser otomatis kalau semua tile Grid sudah bersih",
+        Value = Walk.Enabled,
+        Callback = function(on)
+            Walk.Enabled = on
+            Walk.Stuck = 0
+            if on and State.Mode ~= "Break saja" then
+                notify("Auto Pindah Target", "Hanya jalan di mode Break saja (Farm > Mode & Kecepatan)", 5)
+            end
+        end,
+    })
+end)
+
+safe(function()
+    Box.FarmCtl:Dropdown({
+        Title = "Arah Jalan",
+        Values = { "Kanan", "Kiri" },
+        Value = Walk.Dir,
+        Callback = function(opt)
+            if type(opt) == "table" then opt = opt[1] end
+            if opt == "Kanan" or opt == "Kiri" then Walk.Dir = opt end
+        end,
+    })
+end)
+
+addNumber(Box.FarmCtl, {
+    Title = "Durasi Tekan (ms)",
+    Desc = "Berapa lama tombol arah ditekan",
+    Min = 100, Max = 3000, Step = 50, Default = Walk.HoldMs,
+    Callback = function(v) Walk.HoldMs = math.floor(v) end,
+})
+
+addNumber(Box.FarmCtl, {
+    Title = "Durasi Jeda (ms)",
+    Desc = "Berapa lama berhenti sebelum menekan lagi",
+    Min = 100, Max = 3000, Step = 50, Default = Walk.Ms,
+    Callback = function(v) Walk.WaitMs = math.floor(v) end,
+})
 
 -- ===== TAB: CLEAR WORLD =====
 local ClearTab = makeTab("Clear World", "eraser", "farm")

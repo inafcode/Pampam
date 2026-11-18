@@ -1687,33 +1687,32 @@ function Anim.isArmFn(fn)
     if not getconsts then return false end
     local ok, consts = pcall(getconsts, fn)
     if not ok or type(consts) ~= "table" then return false end
-    local a, b, c = false, false, false
+    local old, reach, arms = 0, false, 0
     for _, k in pairs(consts) do
-        if k == "forearm" then a = true
-        elseif k == "heldReach" then b = true
-        elseif k == "punchReach" then c = true end
+        if k == "forearm" or k == "heldReach" then old += 1
+        elseif k == "punchReach" or k == "reach" then reach = true
+        elseif k == "armAmt" or k == "armSwing" or k == "armEase" or k == "animT" or k == "airPose" then arms += 1 end
     end
-    return a and b and c
+    if old == 2 and reach then return true end -- bentuk lama
+    return reach and arms >= 2 -- bentuk baru
 end
 
 -- Cari nomor upvalue "aksi terakhir" (tabel {t, x, y, facing} atau nil) di fungsi tangan.
 -- Upvalue ini dipakai bersama oleh kode input & gambar karakter game, jadi cukup diganti sekali.
 function Anim.bind(fn)
     local gu = (debug and debug.getupvalue) or getupvalue
-    local su = (debug and debug.setupvalue) or setupvalue
-    if not (gu and su) then return false end
-    local vals, last = {}, 0
-    for i = 1, 16 do
-        local ok, v = pcall(gu, fn, i)
+    if type(gu) ~= "function" then return false end
+    for i = 1, 24 do
+        local ok, a, b = pcall(gu, fn, i)
         if not ok then break end
-        vals[i] = v
-        if v ~= nil then last = i end
-    end
-    for i = 1, last - 1 do
-        local v = vals[i]
-        if v == nil or (type(v) == "table" and rawget(v, "t") ~= nil and rawget(v, "facing") ~= nil) then
-            Anim.fn, Anim.idx, Anim.set = fn, i, su
-            return true
+        local v = (type(a) == "string") and b or a
+        if type(v) == "table" then
+            local act = rawget(v, "action")
+            if type(act) == "table"
+                and (type(rawget(v, "lastPunchAt")) == "number" or type(rawget(v, "PUNCH_EVERY")) == "number") then
+                Anim.fn, Anim.ctx = fn, v
+                return true
+            end
         end
     end
     return false
@@ -2480,6 +2479,10 @@ function Anim.findFast()
                 for _, c in ipairs(conns) do
                     local okf, fn = pcall(function() return c.Function end)
                     if okf and type(fn) == "function" then
+                        if Anim.isArmFn(fn) then
+                            Refs.Arm = fn
+                            if Anim.bind(fn) then return true end
+                        end
                         for _, u in pairs(getUpvalues(fn)) do
                             if type(u) == "function" and Anim.isArmFn(u) then
                                 Refs.Arm = u
@@ -4306,10 +4309,38 @@ end
 -- ===== ANIMASI AKSI (hanya tampilan di layar sendiri, tidak mengirim apa pun ke server) =====
 -- Tangan karakter mengarah ke tile (sama seperti saat pemain memukul / memasang sendiri).
 function Anim.swing(x, y, kind)
-    if not (Anim.fn and Anim.idx and Anim.set) then return end
+    if type(Anim.ctx) ~= "table" or type(rawget(Anim.ctx, "action")) ~= "table" then
+        Anim.ctx, Anim.fn = nil, nil
+        if os.clock() - (Anim.retryAt or 0) > 5 then
+            Anim.retryAt = os.clock()
+            if Anim.findFast then pcall(Anim.findFast) end
+        end
+        if type(Anim.ctx) ~= "table" then return end
+    end
+    local ctx = Anim.ctx
+    local a = rawget(ctx, "action")
+    local now = os.clock()
     local s = playerState()
-    local facing = (s and x + 0.5 < s.x) and -1 or 1
-    pcall(Anim.set, Anim.fn, Anim.idx, { t = os.clock(), x = x + 0.5, y = y + 0.5, facing = facing, kind = kind })
+    local face = (s and x + 0.5 < s.x) and -1 or 1
+    local hit = false
+    for k, v in next, a do -- field waktu aksi = angka besar yang dekat jam sekarang
+        if type(v) == "number" and v > 1000 and math.abs(v - now) < 7200 then
+            a[k] = now
+            hit = true
+        end
+    end
+    if not hit then
+        for _, k in ipairs({ "t", "T", "at", "time", "stamp", "start" }) do
+            if type(rawget(a, k)) == "number" then a[k] = now end
+        end
+    end
+    if type(rawget(a, "x")) == "number" then a.x = x + 0.5 end
+    if type(rawget(a, "y")) == "number" then a.y = y + 0.5 end
+    if type(rawget(a, "facing")) == "number" then a.facing = face end
+    if type(rawget(ctx, "lastPunchAt")) == "number" then ctx.lastPunchAt = now end
+    if type(rawget(ctx, "lastPunchKey")) == "number" and type(rawget(ctx, "cols")) == "number" then
+        ctx.lastPunchKey = y * ctx.cols + x
+    end
 end
 
 -- Efek asap kecil saat block dipasang (pakai efek "place" game)
