@@ -3497,6 +3497,7 @@ end
 -- dengan Auto Farm dan otomatis berhenti saat Auto Farm di-stop.
 local Walk = {
     Enabled = false,
+    DoorOnStuck = true,
     Dir = "Kanan",
     HoldMs = 400,   -- lama tombol arah ditekan
     WaitMs = 500,   -- jeda setelah melangkah (menunggu karakter berhenti / mendarat)
@@ -3679,8 +3680,15 @@ local function farmLoop(runId)
                 end
                 if Walk.Stuck >= 3 then
                     Walk.Stuck = 0
-                    stopFarm("Auto Pindah Target: karakter tidak bisa bergeser (ujung jalan / terhalang / tombol tidak terbaca)")
-                    return
+                    local entered = false
+                    if Walk.DoorOnStuck and Walk.pressDoor then
+                        State.LastAction = "Auto Pindah Target: mentok, mencari pintu..."
+                        entered = Walk.pressDoor(live)
+                    end
+                    if not entered then
+                        stopFarm("Auto Pindah Target: karakter tidak bisa bergeser (ujung jalan / terhalang / tombol tidak terbaca)")
+                        return
+                    end
                 end
             elseif not waitMs((State.Override and State.Override.breakMs) or State.BreakMs, runId) then
                 break
@@ -9927,6 +9935,139 @@ Auto.seedOfBlock = seedOfBlock
 Auto.blockOfSeed = blockOfSeed
 Auto.parseDropTarget = parseDropTarget
 
+-- Saat mentok: cari pintu terdekat, jalan ke sana (A*), lalu tekan tombol atas.
+-- Hasil: true = berhasil masuk (world berubah / karakter pindah)
+-- Saat mentok: cari pintu terdekat, jalan ke tile pintu, lalu coba beberapa cara masuk.
+-- Hasil: true = berhasil masuk (world berubah / karakter pindah jauh)
+function Walk.pressDoor(live)
+    local w = Refs.World
+    local s = playerState()
+    if not w or not s or not OrigIsDown then
+        State.LastAction = "Pintu: kontrol gerak / data world belum terhubung"
+        return false
+    end
+    local px, py = floor(s.x), floor(s.y - 0.475)
+    local found = {}
+    for y = 0, w.h - 1 do
+        local row = w.fg[y]
+        if row then
+            for x = 0, w.w - 1 do
+                local id = row[x] or 0
+                if id ~= 0 then
+                    local it = ItemDB[id]
+                    if it and (it.entrance or it.door) and not it.gate then
+                        found[#found + 1] = { x = x, y = y, id = id, d = abs(x - px) + 1.5 * abs(y - py) }
+                    end
+                end
+            end
+        end
+    end
+    if #found == 0 then
+        State.LastAction = "Pintu: tidak ada pintu di world ini"
+        return false
+    end
+    table.sort(found, function(a, b) return a.d < b.d end)
+
+    -- daftar fungsi world yang namanya berbau pintu (untuk laporan / diagnosa)
+    local doorFns = {}
+    for k, v in pairs(w) do
+        if type(k) == "string" and type(v) == "function" then
+            local n = k:lower()
+            if n:find("door", 1, true) or n:find("entrance", 1, true) then doorFns[#doorFns + 1] = k end
+        end
+    end
+    table.sort(doorFns)
+    Walk.DoorFns = table.concat(doorFns, ", ")
+
+    local startX, startY = s.x, s.y
+    local function entered()
+        if not live() then return true end
+        if Refs.World ~= w then return true end
+        local c = playerState()
+        if not c then return true end
+        return abs(c.x - startX) > 3 or abs(c.y - startY) > 3
+    end
+    local function waitEntered(sec)
+        local untilAt = os.clock() + sec
+        while os.clock() < untilAt do
+            task.wait(0.1)
+            if entered() then return true end
+        end
+        return false
+    end
+    local function standingOn(d)
+        local c = playerState()
+        return c and floor(c.x) == d.x and floor(c.y - 0.475) == d.y
+    end
+
+    for i = 1, math.min(3, #found) do
+        local d = found[i]
+        if not live() then break end
+        State.LastAction = ("Pintu: jalan ke (%d,%d)"):format(d.x, d.y)
+        local reached = false
+        for _, tx in ipairs({ d.x, d.x - 1, d.x + 1 }) do
+            if walkTo(tx, d.y, 45, function() return not live() end) then
+                reached = true
+                break
+            end
+        end
+        if entered() then return true end
+        if reached then
+            -- rapikan ke tengah tile supaya tidak meleset dari pintu
+            local c = playerState()
+            if c and abs(c.x - (floor(c.x) + 0.5)) > 0.25 then
+                execWalk(floor(c.x), floor(c.y - 0.475))
+            end
+
+            -- cara 1: fungsi pintu bawaan game
+            for _, name in ipairs({ "enterDoor", "useDoor", "tapDoor", "useEntrance", "enterEntrance" }) do
+                local f = rawget(w, name)
+                if type(f) == "function" then
+                    State.LastAction = ("Pintu: fungsi game %s (%d,%d)"):format(name, d.x, d.y)
+                    pcall(f, d.x, d.y)
+                    if waitEntered(1.2) then return true end
+                end
+            end
+
+            -- cara 2: tap pintu lewat fungsi pukul game (seperti tap pintu di mobile)
+            if type(Refs.Punch) == "function" then
+                for _ = 1, 3 do
+                    State.LastAction = ("Pintu: tap pintu (%d,%d)"):format(d.x, d.y)
+                    pcall(Refs.Punch, d.x, d.y, State.MutePunch or nil, nil)
+                    if State.Visual and Anim.swing then Anim.swing(d.x, d.y, "punch") end
+                    if waitEntered(0.8) then return true end
+                end
+            end
+
+            -- cara 3: tombol bawah
+            State.LastAction = ("Pintu: tombol bawah (%d,%d)"):format(d.x, d.y)
+            AutoInput.active = true
+            AutoInput.left, AutoInput.right, AutoInput.jump = false, false, false
+            AutoInput.down = true
+            task.wait(0.2)
+            releaseInput()
+            if waitEntered(1) then AutoInput.active = false; return true end
+
+            -- cara 4: satu lompat pendek, hanya kalau berdiri tepat di tile pintu
+            if standingOn(d) then
+                State.LastAction = ("Pintu: tombol atas (%d,%d)"):format(d.x, d.y)
+                AutoInput.jump = true
+                task.wait(0.08)
+                AutoInput.jump = false
+                releaseInput()
+                if waitEntered(1.2) then AutoInput.active = false; return true end
+            end
+            AutoInput.active = false
+            releaseInput()
+        end
+    end
+    State.LastAction = "Pintu: semua cara gagal. Fungsi pintu world: "
+        .. ((Walk.DoorFns ~= "") and Walk.DoorFns or "tidak ada")
+    AutoInput.active = false
+    releaseInput()
+    return false
+end
+
 Auto.walkTo = walkTo
 Auto.startSpliceRoam = startSpliceRoam
 Auto.stopSpliceRoam = stopSpliceRoam
@@ -10714,6 +10855,15 @@ safe(function()
             if type(opt) == "table" then opt = opt[1] end
             if opt == "Kanan" or opt == "Kiri" then Walk.Dir = opt end
         end,
+    })
+end)
+
+safe(function()
+    Box.FarmCtl:Toggle({
+        Title = "Masuk pintu saat mentok",
+        Desc = "Kalau tidak bisa geser lagi, cari pintu terdekat lalu tekan atas",
+        Value = Walk.DoorOnStuck,
+        Callback = function(on) Walk.DoorOnStuck = on end,
     })
 end)
 
