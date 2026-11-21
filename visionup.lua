@@ -414,7 +414,7 @@ end)()
 
 local State = {
     Running = false,
-    Mode = "Place + Break",       -- "Place + Break" | "Break saja" | "Place saja"
+    Mode = "Break saja",       -- "Place + Break" | "Break saja" | "Place saja"
     PlaceMs = 250,                -- jeda setelah tiap place
     BreakMs = 220,                -- jeda tiap pukulan (normal 220)
     AfterBreakMs = 300,           -- jeda setelah block hancur
@@ -3496,10 +3496,10 @@ end
 -- Dipanggil dari farmLoop (thread yang sama), jadi tidak rebutan kontrol gerak
 -- dengan Auto Farm dan otomatis berhenti saat Auto Farm di-stop.
 local Walk = {
-    Enabled = false,
+    Enabled = true,
     DoorOnStuck = true,
     Dir = "Kanan",
-    HoldMs = 400,   -- lama tombol arah ditekan
+    HoldMs = 600,   -- lama tombol arah ditekan
     WaitMs = 500,   -- jeda setelah melangkah (menunggu karakter berhenti / mendarat)
     Count = 0,      -- jumlah langkah
     Stuck = 0,      -- berapa kali berturut-turut tidak bergeser
@@ -10376,6 +10376,28 @@ table.insert(Connections, LocalPlayer.Idled:Connect(function()
         VirtualUser:CaptureController()
         VirtualUser:ClickButton2(Vector2.new())
     end
+end))
+
+---------------------------------------------------------------------
+-- SHORTCUT KEYBOARD: tekan Q untuk start/stop Auto Farm
+---------------------------------------------------------------------
+table.insert(Connections, UserInputService.InputBegan:Connect(function(input)
+    if not alive() then return end
+    if input.KeyCode ~= Enum.KeyCode.Q then return end
+    -- jangan aktif saat sedang mengetik di kotak teks (menu / chat)
+    if UserInputService:GetFocusedTextBox() then return end
+    -- Auto Farm yang dijalankan Pabrik / Dirt Farm tidak boleh diganggu
+    if State.Override then return end
+    task.spawn(function()
+        local ok, err = pcall(function()
+            if State.Running then
+                stopFarm("Dihentikan dengan tombol Q")
+            else
+                startFarm()
+            end
+        end)
+        if not ok then warn("[Zekio supreme TEST] Shortcut Q error: " .. tostring(err)) end
+    end)
 end))
 
 ---------------------------------------------------------------------
